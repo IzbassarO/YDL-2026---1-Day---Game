@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Buddy Protocol: Neon Quarantine</title>
+<style>
+  :root{
+    --bg:#080B16; --floor:#12192B; --panel:#172033;
+    --cyan:#42E8F4; --purple:#7D4DFF; --amber:#FFB84D;
+    --red:#FF4D6D; --green:#66FF99; --white:#EAF6FF;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  html,body{height:100%; background:var(--bg); overflow:hidden;
+    font-family:"Segoe UI",system-ui,sans-serif; color:var(--white);}
+  #game{display:block; width:100vw; height:100vh;}
+
+  /* ---- Overlays (MVVM-style screens layered over the canvas) ---- */
+  .overlay{
+    position:fixed; inset:0; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; gap:18px;
+    background:radial-gradient(circle at 50% 40%, rgba(66,232,244,.06), rgba(8,11,22,.92));
+    text-align:center; z-index:10;
+  }
+  .overlay.hidden{display:none;}
+  .title{font-size:clamp(34px,7vw,72px); font-weight:800; letter-spacing:6px;
+    color:var(--cyan); text-shadow:0 0 18px rgba(66,232,244,.7);}
+  .subtitle{font-size:clamp(14px,2.4vw,22px); letter-spacing:10px; color:var(--purple);
+    text-shadow:0 0 14px rgba(125,77,255,.7); margin-top:-8px;}
+  .hint{opacity:.7; font-size:14px; letter-spacing:1px; max-width:520px; line-height:1.6;}
+  .btn{
+    min-width:260px; padding:16px 28px; font-size:18px; letter-spacing:3px; font-weight:700;
+    color:var(--cyan); background:rgba(23,32,51,.6); border:1px solid var(--cyan);
+    border-radius:6px; cursor:pointer; text-transform:uppercase;
+    box-shadow:0 0 0 rgba(66,232,244,0); transition:all .15s ease;
+  }
+  .btn:hover{background:rgba(66,232,244,.12); box-shadow:0 0 22px rgba(66,232,244,.5);
+    transform:translateY(-2px);}
+  .btn.secondary{color:var(--purple); border-color:var(--purple);}
+  .btn.secondary:hover{background:rgba(125,77,255,.12); box-shadow:0 0 22px rgba(125,77,255,.5);}
+  .stat{font-size:20px; letter-spacing:2px;}
+  .stat b{color:var(--amber);}
+
+  /* ---- Onboarding (Buddy dialogue) ---- */
+  #buddyBox{max-width:560px; padding:22px 26px; background:rgba(23,32,51,.85);
+    border:1px solid var(--cyan); border-radius:10px; box-shadow:0 0 26px rgba(66,232,244,.25);}
+  #buddyText{font-size:18px; line-height:1.6; min-height:80px;}
+  .buddyName{color:var(--cyan); letter-spacing:3px; font-weight:700; margin-bottom:8px;}
+  .row{display:flex; gap:14px; flex-wrap:wrap; justify-content:center;}
+
+  /* ---- HUD ---- */
+  #hud{position:fixed; inset:0; pointer-events:none; z-index:5; display:none;}
+  #hud.show{display:block;}
+  .hud-top{position:absolute; top:14px; left:0; right:0; display:flex;
+    justify-content:space-between; align-items:flex-start; padding:0 18px;}
+  #hpWrap{width:240px;}
+  #hpLabel{font-size:12px; letter-spacing:2px; opacity:.8; margin-bottom:4px;}
+  #hpBar{height:16px; border:1px solid var(--cyan); border-radius:8px; overflow:hidden;
+    background:rgba(0,0,0,.4);}
+  #hpFill{height:100%; width:100%; background:linear-gradient(90deg,var(--green),var(--cyan));
+    transition:width .1s linear;}
+  .hud-center{text-align:center;}
+  #timer{font-size:30px; font-weight:800; letter-spacing:3px; color:var(--white);
+    text-shadow:0 0 12px rgba(66,232,244,.6);}
+  #wave{font-size:13px; letter-spacing:3px; color:var(--purple); margin-top:2px;}
+  #score{font-size:26px; font-weight:800; letter-spacing:2px; color:var(--amber);
+    text-shadow:0 0 12px rgba(255,184,77,.5); text-align:right;}
+  #scoreLabel{font-size:12px; letter-spacing:2px; opacity:.8; text-align:right;}
+  .pausetag{position:absolute; bottom:14px; left:18px; font-size:12px; opacity:.5; letter-spacing:2px;}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<!-- ================= SCREENS ================= -->
+
+<!-- Onboarding -->
+<div id="onboarding" class="overlay">
+  <div class="buddyName">◈ BUDDY</div>
+  <div id="buddyBox">
+    <div id="buddyText"></div>
+  </div>
+  <div class="row">
+    <button id="btnNext" class="btn">Next</button>
+    <button id="btnSkip" class="btn secondary">Skip</button>
+  </div>
+</div>
+
+<!-- Main menu -->
+<div id="menu" class="overlay hidden">
+  <div class="title">BUDDY PROTOCOL</div>
+  <div class="subtitle">NEON QUARANTINE</div>
+  <div class="row" style="flex-direction:column; margin-top:18px;">
+    <button id="btnStart" class="btn">Start</button>
+    <button id="btnHow" class="btn secondary">How to play</button>
+  </div>
+  <div class="hint" id="bestLine"></div>
+</div>
+
+<!-- How to play -->
+<div id="how" class="overlay hidden">
+  <div class="title" style="font-size:42px;">HOW TO PLAY</div>
+  <div class="hint" style="font-size:16px;">
+    Move with <b>WASD</b> or <b>Arrow Keys</b>.<br/>
+    Your weapon is synced with Buddy — it <b>auto-aims and fires</b> at the nearest mob.<br/>
+    You only control movement. Keep distance, use walls, never stand still.<br/>
+    Survive the waves. <b>P / Esc</b> to pause, <b>R</b> to restart after death.
+  </div>
+  <button id="btnHowBack" class="btn">Back</button>
+</div>
+
+<!-- Pause -->
+<div id="pause" class="overlay hidden">
+  <div class="title" style="font-size:48px;">PAUSED</div>
+  <button id="btnResume" class="btn">Resume</button>
+  <button id="btnQuit" class="btn secondary">Quit to Menu</button>
+</div>
+
+<!-- Game over -->
+<div id="gameover" class="overlay hidden">
+  <div class="title" style="color:var(--red); text-shadow:0 0 18px rgba(255,77,109,.7); font-size:52px;">GAME OVER</div>
+  <div class="stat">Score: <b id="goScore">0</b></div>
+  <div class="stat">Best: <b id="goBest">0</b></div>
+  <div class="stat">Survived: <b id="goTime">0s</b></div>
+  <div class="row" style="margin-top:14px;">
+    <button id="btnRestart" class="btn">Restart</button>
+    <button id="btnMenu" class="btn secondary">Main Menu</button>
+  </div>
+  <div class="hint">Press R to restart</div>
+</div>
+
+<!-- HUD -->
+<div id="hud">
+  <div class="hud-top">
+    <div id="hpWrap">
+      <div id="hpLabel">INTEGRITY</div>
+      <div id="hpBar"><div id="hpFill"></div></div>
+    </div>
+    <div class="hud-center">
+      <div id="timer">0:00</div>
+      <div id="wave">WAVE 1</div>
+    </div>
+    <div>
+      <div id="scoreLabel">SCORE</div>
+      <div id="score">0</div>
+    </div>
+  </div>
+  <div class="pausetag">P / ESC — PAUSE</div>
+</div>
+
+<script>
+"use strict";
+/* =====================================================================
+   Buddy Protocol: Neon Quarantine — single-file MVP
+   Vanilla JS + Canvas 2D. No build step. Double-click index.html to play.
+
+   Structure (kept class-based so it can port to a TS/ECS architecture later):
+     GameState  - enum of screens
+     Input      - keyboard manager
+     Camera     - smooth follow + screen shake
+     LevelGenerator / TileMap - random rooms + corridors + wall collision
+     Player / Mob / Bullet / Particle - entities
+     Game       - world, loop, systems wiring, UI glue
+   ===================================================================== */
+
+// ---------- Config (single source of truth for tunables) ----------
+const CFG = {
+  TILE: 64,
+  player: { hp: 100, speed: 240, radius: 16 },
+  weapon: { fireRateMs: 350, range: 500, bulletSpeed: 650, bulletDamage: 25, bulletRadius: 5 },
+  mob:    { hp: 50, speedMin: 70, speedMax: 110, contactDps: 10, radius: 18, scorePerKill: 10 },
+  waves:  { baseCount: 6, perWave: 3, intervalMs: 9000, hpScale: 0.12, speedScale: 0.05 },
+};
+
+const GameState = { ONBOARDING:'onboarding', MENU:'menu', HOW:'how',
+  PLAYING:'playing', PAUSED:'paused', GAME_OVER:'game_over' };
+
+// ---------- Math helpers ----------
+const clamp = (v,a,b)=>v<a?a:v>b?b:v;
+const dist2 = (ax,ay,bx,by)=>{const dx=ax-bx,dy=ay-by;return dx*dx+dy*dy;};
+const rand  = (a,b)=>a+Math.random()*(b-a);
+const randi = (a,b)=>Math.floor(rand(a,b+1));
+
+// =====================================================================
+// Input
+// =====================================================================
+class Input{
+  constructor(){
+    this.keys = {};
+    addEventListener('keydown', e=>{ this.keys[e.code]=true; this._onKey(e); });
+    addEventListener('keyup',   e=>{ this.keys[e.code]=false; });
+    this.onPause=null; this.onRestart=null;
+  }
+  _onKey(e){
+    if(e.code==='KeyP'||e.code==='Escape'){ this.onPause&&this.onPause(); }
+    if(e.code==='KeyR'){ this.onRestart&&this.onRestart(); }
+  }
+  axis(){
+    let x=0,y=0;
+    if(this.keys.KeyA||this.keys.ArrowLeft)  x-=1;
+    if(this.keys.KeyD||this.keys.ArrowRight) x+=1;
+    if(this.keys.KeyW||this.keys.ArrowUp)    y-=1;
+    if(this.keys.KeyS||this.keys.ArrowDown)  y+=1;
+    if(x&&y){ const k=Math.SQRT1_2; x*=k; y*=k; } // normalize diagonal
+    return {x,y};
+  }
+}
+
+// =====================================================================
+// Camera (smooth follow + screen shake)
+// =====================================================================
+class Camera{
+  constructor(){ this.x=0; this.y=0; this.shake=0; this.ox=0; this.oy=0; }
+  follow(tx,ty,vw,vh,dt){
+    const cx=tx-vw/2, cy=ty-vh/2;
+    this.x += (cx-this.x)*Math.min(1, dt*6);
+    this.y += (cy-this.y)*Math.min(1, dt*6);
+    if(this.shake>0){
+      this.shake=Math.max(0,this.shake-dt*40);
+      this.ox=rand(-this.shake,this.shake);
+      this.oy=rand(-this.shake,this.shake);
+    } else { this.ox=this.oy=0; }
+  }
+  addShake(a){ this.shake=Math.min(18, this.shake+a); }
+}
+
+// =====================================================================
+// Level generation — grid of rooms joined by corridors.
+// 0 = floor, 1 = wall.
+// =====================================================================
+class TileMap{
+  constructor(cols,rows){
+    this.cols=cols; this.rows=rows; this.T=CFG.TILE;
+    this.grid=new Array(cols*rows).fill(1);
+    this.rooms=[];
+  }
+  at(c,r){ if(c<0||r<0||c>=this.cols||r>=this.rows) return 1; return this.grid[r*this.cols+c]; }
+  set(c,r,v){ if(c<0||r<0||c>=this.cols||r>=this.rows) return; this.grid[r*this.cols+c]=v; }
+  isWallPx(px,py){ return this.at(Math.floor(px/this.T), Math.floor(py/this.T))===1; }
+  pxW(){ return this.cols*this.T; }
+  pxH(){ return this.rows*this.T; }
+}
+
+class LevelGenerator{
+  static generate(){
+    const cols=randi(34,42), rows=randi(26,32);
+    const map=new TileMap(cols,rows);
+    const roomCount=randi(6,9);
+    const rooms=[];
+    let tries=0;
+    while(rooms.length<roomCount && tries<200){
+      tries++;
+      const w=randi(5,9), h=randi(4,7);
+      const c=randi(1,cols-w-2), r=randi(1,rows-h-2);
+      const room={c,r,w,h,cx:c+(w>>1),cy:r+(h>>1)};
+      if(rooms.some(o=>room.c<o.c+o.w+1 && room.c+room.w+1>o.c &&
+                        room.r<o.r+o.h+1 && room.r+room.h+1>o.r)) continue;
+      rooms.push(room);
+      for(let y=r;y<r+h;y++) for(let x=c;x<c+w;x++) map.set(x,y,0);
+    }
+    // connect rooms with L-shaped corridors
+    for(let i=1;i<rooms.length;i++){
+      const a=rooms[i-1], b=rooms[i];
+      LevelGenerator.carveH(map,a.cx,b.cx,a.cy);
+      LevelGenerator.carveV(map,a.cy,b.cy,b.cx);
+    }
+    map.rooms=rooms;
+    return map;
+  }
+  static carveH(m,x1,x2,y){ for(let x=Math.min(x1,x2);x<=Math.max(x1,x2);x++){m.set(x,y,0);m.set(x,y+1,0);} }
+  static carveV(m,y1,y2,x){ for(let y=Math.min(y1,y2);y<=Math.max(y1,y2);y++){m.set(x,y,0);m.set(x+1,y,0);} }
+}
+
+// =====================================================================
+// Collision — circle vs wall tiles (axis-separated resolution)
+// =====================================================================
+function moveWithCollision(map,e,nx,ny){
+  const T=map.T, rad=e.radius;
+  // X axis
+  let tryX=e.x+nx;
+  if(!circleHitsWall(map,tryX,e.y,rad)) e.x=tryX;
+  // Y axis
+  let tryY=e.y+ny;
+  if(!circleHitsWall(map,e.x,tryY,rad)) e.y=tryY;
+  // keep inside bounds
+  e.x=clamp(e.x,rad,map.pxW()-rad);
+  e.y=clamp(e.y,rad,map.pxH()-rad);
+}
+function circleHitsWall(map,px,py,rad){
+  const T=map.T;
+  const c0=Math.floor((px-rad)/T), c1=Math.floor((px+rad)/T);
+  const r0=Math.floor((py-rad)/T), r1=Math.floor((py+rad)/T);
+  for(let r=r0;r<=r1;r++) for(let c=c0;c<=c1;c++){
+    if(map.at(c,r)===1){
+      const nx=clamp(px,c*T,c*T+T), ny=clamp(py,r*T,r*T+T);
+      if(dist2(px,py,nx,ny) < rad*rad) return true;
+    }
+  }
+  return false;
+}
+
+// =====================================================================
+// Entities
+// =====================================================================
+class Player{
+  constructor(x,y){
+    this.x=x; this.y=y; this.radius=CFG.player.radius;
+    this.hp=CFG.player.hp; this.maxHp=CFG.player.hp;
+    this.speed=CFG.player.speed; this.fireTimer=0; this.flash=0; this.facing=1;
+  }
+  update(dt,game){
+    const ax=game.input.axis();
+    if(ax.x) this.facing=Math.sign(ax.x);
+    moveWithCollision(game.map,this,ax.x*this.speed*dt,ax.y*this.speed*dt);
+    if(this.flash>0) this.flash-=dt;
+
+    // ---- Auto-aim weapon ----
+    this.fireTimer-=dt*1000;
+    if(this.fireTimer<=0){
+      const target=game.nearestMob(this.x,this.y,CFG.weapon.range);
+      if(target){
+        this.fireTimer=CFG.weapon.fireRateMs;
+        const dx=target.x-this.x, dy=target.y-this.y;
+        const len=Math.hypot(dx,dy)||1;
+        game.bullets.push(new Bullet(this.x,this.y,dx/len,dy/len));
+        for(let i=0;i<3;i++) game.particles.push(Particle.spark(this.x,this.y,CFG.cyan||'#42E8F4'));
+      }
+    }
+  }
+  hurt(d){ this.hp=Math.max(0,this.hp-d); this.flash=0.25; }
+}
+
+class Mob{
+  constructor(x,y,scale){
+    this.x=x; this.y=y; this.radius=CFG.mob.radius;
+    this.maxHp=CFG.mob.hp*(1+scale*CFG.waves.hpScale);
+    this.hp=this.maxHp;
+    this.speed=rand(CFG.mob.speedMin,CFG.mob.speedMax)*(1+scale*CFG.waves.speedScale);
+    this.dead=false; this.flash=0;
+  }
+  update(dt,game){
+    const p=game.player;
+    const dx=p.x-this.x, dy=p.y-this.y;
+    const len=Math.hypot(dx,dy)||1;
+    moveWithCollision(game.map,this,(dx/len)*this.speed*dt,(dy/len)*this.speed*dt);
+    if(this.flash>0) this.flash-=dt;
+    // contact damage
+    const rr=this.radius+p.radius;
+    if(dist2(this.x,this.y,p.x,p.y) < rr*rr){
+      p.hurt(CFG.mob.contactDps*dt);
+      game.camera.addShake(2);
+    }
+  }
+  hurt(d,game){
+    this.hp-=d; this.flash=0.12;
+    if(this.hp<=0 && !this.dead){
+      this.dead=true;
+      game.score+=CFG.mob.scorePerKill;
+      game.camera.addShake(3);
+      for(let i=0;i<14;i++) game.particles.push(Particle.death(this.x,this.y));
+    }
+  }
+}
+
+class Bullet{
+  constructor(x,y,dx,dy){
+    this.x=x; this.y=y; this.dx=dx; this.dy=dy;
+    this.speed=CFG.weapon.bulletSpeed; this.radius=CFG.weapon.bulletRadius;
+    this.life=CFG.weapon.range/this.speed + 0.05; this.dead=false;
+  }
+  update(dt,game){
+    this.x+=this.dx*this.speed*dt; this.y+=this.dy*this.speed*dt;
+    this.life-=dt;
+    if(this.life<=0 || game.map.isWallPx(this.x,this.y)){ this.dead=true; return; }
+    for(const m of game.mobs){
+      if(m.dead) continue;
+      const rr=this.radius+m.radius;
+      if(dist2(this.x,this.y,m.x,m.y) < rr*rr){
+        m.hurt(CFG.weapon.bulletDamage,game);
+        this.dead=true;
+        game.particles.push(Particle.spark(this.x,this.y,'#FFB84D'));
+        break;
+      }
+    }
+  }
+}
+
+class Particle{
+  constructor(x,y,vx,vy,life,color,size){
+    this.x=x;this.y=y;this.vx=vx;this.vy=vy;this.life=life;this.max=life;
+    this.color=color;this.size=size;this.dead=false;
+  }
+  static spark(x,y,color){ const a=rand(0,Math.PI*2),s=rand(40,160);
+    return new Particle(x,y,Math.cos(a)*s,Math.sin(a)*s,rand(.15,.4),color,rand(2,4)); }
+  static death(x,y){ const a=rand(0,Math.PI*2),s=rand(60,220);
+    return new Particle(x,y,Math.cos(a)*s,Math.sin(a)*s,rand(.3,.7),
+      Math.random()<.5?'#FF4D6D':'#7D4DFF',rand(2,5)); }
+  update(dt){ this.x+=this.vx*dt; this.y+=this.vy*dt; this.vx*=.92; this.vy*=.92;
+    this.life-=dt; if(this.life<=0) this.dead=true; }
+}
+
+// =====================================================================
+// Game
+// =====================================================================
+class Game{
+  constructor(){
+    this.canvas=document.getElementById('game');
+    this.ctx=this.canvas.getContext('2d');
+    this.input=new Input();
+    this.camera=new Camera();
+    this.state=GameState.ONBOARDING;
+    this.difficulty='Normal';
+    this.best=parseInt(localStorage.getItem('bp_best')||'0',10);
+
+    this.input.onPause=()=>this.togglePause();
+    this.input.onRestart=()=>{ if(this.state===GameState.GAME_OVER) this.startRun(); };
+
+    this._resize=this.resize.bind(this);
+    addEventListener('resize',this._resize); this.resize();
+
+    this.bindUI();
+    this.setupOnboarding();
+
+    this.last=performance.now();
+    requestAnimationFrame(this.loop.bind(this));
+  }
+
+  resize(){ this.canvas.width=innerWidth; this.canvas.height=innerHeight; }
+
+  // ---------- UI / screen glue (MVVM-ish: DOM screens react to state) ----------
+  show(id,on){ document.getElementById(id).classList.toggle('hidden',!on); }
+  setState(s){
+    this.state=s;
+    this.show('onboarding', s===GameState.ONBOARDING);
+    this.show('menu',       s===GameState.MENU);
+    this.show('how',        s===GameState.HOW);
+    this.show('pause',      s===GameState.PAUSED);
+    this.show('gameover',   s===GameState.GAME_OVER);
+    document.getElementById('hud').classList.toggle('show',
+      s===GameState.PLAYING||s===GameState.PAUSED);
+    if(s===GameState.MENU){
+      document.getElementById('bestLine').textContent =
+        this.best>0 ? `Best score: ${this.best}` : 'Move • Survive • Let Buddy do the aiming';
+    }
+  }
+
+  bindUI(){
+    const go=(id,fn)=>document.getElementById(id).addEventListener('click',fn);
+    go('btnStart', ()=>this.startRun());
+    go('btnHow',   ()=>this.setState(GameState.HOW));
+    go('btnHowBack',()=>this.setState(GameState.MENU));
+    go('btnResume',()=>this.togglePause());
+    go('btnQuit',  ()=>this.setState(GameState.MENU));
+    go('btnRestart',()=>this.startRun());
+    go('btnMenu',  ()=>this.setState(GameState.MENU));
+  }
+
+  setupOnboarding(){
+    this.steps=[
+      "Welcome to N-7. I am Buddy. Stay close — this place is infected.",
+      "Move with WASD or Arrow Keys. Keep moving, never stand still.",
+      "Your weapon is synced with me. It automatically targets the nearest enemy.",
+      "Mobs will chase you in waves. Use walls and corridors to survive.",
+      "Survive as long as possible. Ready? Press Start.",
+    ];
+    this.step=0;
+    const txt=document.getElementById('buddyText');
+    const render=()=>{ txt.textContent=this.steps[this.step]; };
+    render();
+    document.getElementById('btnNext').addEventListener('click',()=>{
+      if(this.step<this.steps.length-1){ this.step++; render();
+        if(this.step===this.steps.length-1) document.getElementById('btnNext').textContent='Start';
+      } else { this.setState(GameState.MENU); }
+    });
+    document.getElementById('btnSkip').addEventListener('click',()=>this.setState(GameState.MENU));
+    this.setState(GameState.ONBOARDING);
+  }
+
+  togglePause(){
+    if(this.state===GameState.PLAYING) this.setState(GameState.PAUSED);
+    else if(this.state===GameState.PAUSED) this.setState(GameState.PLAYING);
+  }
+
+  // ---------- Run lifecycle ----------
+  startRun(){
+    this.map=LevelGenerator.generate();
+    const r0=this.map.rooms[0];
+    const T=this.map.T;
+    this.player=new Player((r0.cx+.5)*T,(r0.cy+.5)*T);
+    this.mobs=[]; this.bullets=[]; this.particles=[];
+    this.score=0; this.elapsed=0; this.wave=0; this.waveTimer=0;
+    this.spawnWave();
+    this.setState(GameState.PLAYING);
+  }
+
+  spawnWave(){
+    this.wave++;
+    this.waveTimer=CFG.waves.intervalMs/1000;
+    const count=CFG.waves.baseCount+(this.wave-1)*CFG.waves.perWave;
+    const rooms=this.map.rooms, T=this.map.T;
+    for(let i=0;i<count;i++){
+      // spawn in a random room that isn't the player's start room
+      const room=rooms[randi(1,rooms.length-1)] || rooms[0];
+      const x=(room.c+rand(.5,room.w-.5))*T;
+      const y=(room.r+rand(.5,room.h-.5))*T;
+      this.mobs.push(new Mob(x,y,this.wave-1));
+    }
+  }
+
+  nearestMob(x,y,range){
+    let best=null,bd=range*range;
+    for(const m of this.mobs){ if(m.dead) continue;
+      const d=dist2(x,y,m.x,m.y); if(d<bd){bd=d;best=m;} }
+    return best;
+  }
+
+  // ---------- Main loop ----------
+  loop(now){
+    let dt=(now-this.last)/1000; this.last=now;
+    dt=Math.min(dt,0.05); // clamp big frame gaps
+    if(this.state===GameState.PLAYING) this.update(dt);
+    this.render();
+    requestAnimationFrame(this.loop.bind(this));
+  }
+
+  update(dt){
+    this.elapsed+=dt;
+    // waves
+    this.waveTimer-=dt;
+    if(this.waveTimer<=0) this.spawnWave();
+
+    this.player.update(dt,this);
+    for(const m of this.mobs) m.update(dt,this);
+    for(const b of this.bullets) b.update(dt,this);
+    for(const p of this.particles) p.update(dt);
+
+    this.mobs=this.mobs.filter(m=>!m.dead);
+    this.bullets=this.bullets.filter(b=>!b.dead);
+    this.particles=this.particles.filter(p=>!p.dead);
+
+    this.camera.follow(this.player.x,this.player.y,this.canvas.width,this.canvas.height,dt);
+    this.updateHUD();
+
+    if(this.player.hp<=0) this.gameOver();
+  }
+
+  gameOver(){
+    if(this.score>this.best){ this.best=this.score; localStorage.setItem('bp_best',String(this.best)); }
+    document.getElementById('goScore').textContent=this.score;
+    document.getElementById('goBest').textContent=this.best;
+    document.getElementById('goTime').textContent=Math.floor(this.elapsed)+'s';
+    this.setState(GameState.GAME_OVER);
+  }
+
+  updateHUD(){
+    const p=this.player;
+    document.getElementById('hpFill').style.width=(p.hp/p.maxHp*100)+'%';
+    document.getElementById('score').textContent=this.score;
+    const t=Math.floor(this.elapsed);
+    document.getElementById('timer').textContent=Math.floor(t/60)+':'+String(t%60).padStart(2,'0');
+    document.getElementById('wave').textContent='WAVE '+this.wave;
+  }
+
+  // ---------- Rendering ----------
+  render(){
+    const ctx=this.ctx, W=this.canvas.width, H=this.canvas.height;
+    ctx.fillStyle='#080B16'; ctx.fillRect(0,0,W,H);
+    if(!this.map) return; // nothing to draw before first run
+
+    const cam=this.camera, ox=-cam.x+cam.ox, oy=-cam.y+cam.oy;
+    ctx.save(); ctx.translate(ox,oy);
+
+    this.drawMap(ctx);
+    // shadows first
+    this.drawShadow(ctx,this.player.x,this.player.y,this.player.radius);
+    for(const m of this.mobs) this.drawShadow(ctx,m.x,m.y,m.radius);
+
+    // depth-sorted entities (player + mobs) by y
+    const ents=[this.player,...this.mobs].sort((a,b)=>a.y-b.y);
+    for(const e of ents){ if(e===this.player) this.drawPlayer(ctx,e); else this.drawMob(ctx,e); }
+
+    for(const b of this.bullets) this.drawBullet(ctx,b);
+    for(const p of this.particles) this.drawParticle(ctx,p);
+
+    ctx.restore();
+  }
+
+  drawMap(ctx){
+    const m=this.map,T=m.T;
+    const cam=this.camera, W=this.canvas.width, H=this.canvas.height;
+    const c0=Math.max(0,Math.floor(cam.x/T)-1), c1=Math.min(m.cols-1,Math.floor((cam.x+W)/T)+1);
+    const r0=Math.max(0,Math.floor(cam.y/T)-1), r1=Math.min(m.rows-1,Math.floor((cam.y+H)/T)+1);
+    for(let r=r0;r<=r1;r++) for(let c=c0;c<=c1;c++){
+      const x=c*T,y=r*T;
+      if(m.at(c,r)===0){
+        ctx.fillStyle=((c+r)&1)?'#12192B':'#141d31';
+        ctx.fillRect(x,y,T,T);
+        ctx.strokeStyle='rgba(66,232,244,.05)'; ctx.strokeRect(x+.5,y+.5,T-1,T-1);
+      } else {
+        // pseudo-3D wall: tall body + lit top edge
+        ctx.fillStyle='#0c1020'; ctx.fillRect(x,y,T,T);
+        ctx.fillStyle='#1d2740'; ctx.fillRect(x,y,T,T*0.6);
+        ctx.fillStyle='rgba(125,77,255,.25)'; ctx.fillRect(x,y,T,4);
+      }
+    }
+  }
+  drawShadow(ctx,x,y,r){
+    ctx.fillStyle='rgba(0,0,0,.45)';
+    ctx.beginPath(); ctx.ellipse(x,y+r*0.7,r*1.05,r*0.5,0,0,Math.PI*2); ctx.fill();
+  }
+  drawPlayer(ctx,p){
+    const hit=p.flash>0;
+    ctx.save(); ctx.translate(p.x,p.y);
+    // body
+    ctx.fillStyle=hit?'#FF4D6D':'#1b2540';
+    ctx.beginPath(); ctx.arc(0,-4,p.radius,0,Math.PI*2); ctx.fill();
+    ctx.lineWidth=2; ctx.strokeStyle='#42E8F4'; ctx.stroke();
+    // visor
+    ctx.fillStyle='#42E8F4'; ctx.shadowColor='#42E8F4'; ctx.shadowBlur=10;
+    ctx.fillRect(-7+p.facing*3,-10,10,5); ctx.shadowBlur=0;
+    ctx.restore();
+  }
+  drawMob(ctx,m){
+    const hit=m.flash>0;
+    ctx.save(); ctx.translate(m.x,m.y);
+    ctx.fillStyle=hit?'#ffffff':'#241324';
+    ctx.beginPath(); ctx.arc(0,-4,m.radius,0,Math.PI*2); ctx.fill();
+    ctx.lineWidth=2; ctx.strokeStyle='#FF4D6D'; ctx.stroke();
+    // glowing cracks / eyes
+    ctx.fillStyle='#FF4D6D'; ctx.shadowColor='#7D4DFF'; ctx.shadowBlur=8;
+    ctx.beginPath(); ctx.arc(-5,-6,2.5,0,Math.PI*2); ctx.arc(5,-6,2.5,0,Math.PI*2); ctx.fill();
+    ctx.shadowBlur=0;
+    // hp pip
+    if(m.hp<m.maxHp){
+      ctx.fillStyle='rgba(0,0,0,.6)'; ctx.fillRect(-m.radius,-m.radius-10,m.radius*2,4);
+      ctx.fillStyle='#66FF99'; ctx.fillRect(-m.radius,-m.radius-10,m.radius*2*(m.hp/m.maxHp),4);
+    }
+    ctx.restore();
+  }
+  drawBullet(ctx,b){
+    ctx.save(); ctx.fillStyle='#FFB84D'; ctx.shadowColor='#FFB84D'; ctx.shadowBlur=12;
+    ctx.beginPath(); ctx.arc(b.x,b.y,b.radius,0,Math.PI*2); ctx.fill();
+    ctx.restore();
+  }
+  drawParticle(ctx,p){
+    ctx.globalAlpha=Math.max(0,p.life/p.max);
+    ctx.fillStyle=p.color;
+    ctx.fillRect(p.x-p.size/2,p.y-p.size/2,p.size,p.size);
+    ctx.globalAlpha=1;
+  }
+}
+
+// Boot
+window.addEventListener('load',()=>{ new Game(); });
+</script>
+</body>
+</html>
