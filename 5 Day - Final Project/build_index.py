@@ -68,8 +68,12 @@ def chunk_text(text: str, size: int, overlap: int) -> list[str]:
     return [c for c in chunks if c]
 
 
+MAX_ATTEMPTS = 7          # больше попыток — переживаем длительный rate-limit
+INTER_CALL_DELAY = 0.25   # троттлинг между чанками, чтобы не упираться в 429
+
+
 def embed_batch(texts: list[str]) -> np.ndarray:
-    """Эмбеддинги для списка текстов. Поддерживает батч или поэлементно."""
+    """Эмбеддинги для списка текстов (поэлементно), устойчиво к 429/5xx."""
     vectors = []
     total = len(texts)
     for n, t in enumerate(texts, 1):
@@ -78,7 +82,7 @@ def embed_batch(texts: list[str]) -> np.ndarray:
             "Content-Type": "application/json",
             "Authorization": f"Bearer {config.EMB_KEY}",
         }
-        for attempt in range(3):
+        for attempt in range(MAX_ATTEMPTS):
             try:
                 apilog.request(f"EMBED {n}/{total}", config.EMB_MODEL, t)
                 with apilog.timer() as tm:
@@ -86,18 +90,27 @@ def embed_batch(texts: list[str]) -> np.ndarray:
                         config.EMB_URL, json=payload, headers=headers,
                         timeout=config.REQUEST_TIMEOUT,
                     )
-                ok = r.ok
-                vec = r.json()["data"][0]["embedding"] if ok else None
+                # 429/5xx — ждём (учитываем Retry-After) и повторяем
+                if r.status_code == 429 or r.status_code >= 500:
+                    wait = float(r.headers.get("Retry-After", 0)) or min(3 * 2 ** attempt, 40)
+                    apilog.response(f"EMBED {n}/{total}", r.status_code, tm.dt,
+                                    f"повтор через {wait:.0f}s ({attempt + 1}/{MAX_ATTEMPTS})")
+                    if attempt == MAX_ATTEMPTS - 1:
+                        r.raise_for_status()
+                    time.sleep(wait)
+                    continue
+                vec = r.json()["data"][0]["embedding"] if r.ok else None
                 apilog.response(f"EMBED {n}/{total}", r.status_code, tm.dt,
                                 f"dim={len(vec)}" if vec else (r.text or "")[:120])
                 r.raise_for_status()
                 vectors.append(vec)
                 break
-            except Exception as e:
-                apilog.error(f"EMBED {n}/{total} попытка {attempt+1}", e)
-                if attempt == 2:
+            except requests.exceptions.RequestException as e:
+                apilog.error(f"EMBED {n}/{total} попытка {attempt + 1}", e)
+                if attempt == MAX_ATTEMPTS - 1:
                     raise RuntimeError(f"Эмбеддинг не получен: {e}")
-                time.sleep(1.5 * (attempt + 1))
+                time.sleep(min(3 * 2 ** attempt, 40))
+        time.sleep(INTER_CALL_DELAY)  # вежливый троттлинг
     arr = np.array(vectors, dtype="float32")
     return arr
 
