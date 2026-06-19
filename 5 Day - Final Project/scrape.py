@@ -10,12 +10,16 @@ scrape.py — сбор данных с сайта фонда Есенова.
      ("где результаты", "как подать заявку"). RAG найдёт их так же,
      как и текст сайта, и отдаст пользователю со ссылкой.
 
-Результат: data/corpus.jsonl — по одному документу на строку:
-  {"id": ..., "source": url, "title": ..., "text": ...}
+  4. Оставляем только РУССКИЕ версии страниц (ru/en/kk-дубли схлопываются).
+
+Результат: data/corpus.md — все документы в одном файле, каждый в виде:
+  # Заголовок
+  Source: url
+
+  текст…
 
 Запуск:  python scrape.py
 """
-import json
 import time
 import re
 from collections import deque
@@ -130,6 +134,60 @@ PROCEDURE_CARDS = [
 ]
 
 
+def logical_key(source: str) -> str:
+    """Ключ страницы без языкового префикса — чтобы схлопнуть ru/en/kk-дубли."""
+    if source.startswith("manual://"):
+        return source
+    path = urlparse(source).path
+    return re.sub(r"^/(ru|en|kk)(?=/|$)", "", path) or "/"
+
+
+def is_russian(text: str) -> bool:
+    """Грубое определение: кириллицы больше латиницы и мало казахских букв."""
+    head = text[:3000]
+    kk = len(re.findall(r"[әқғңұүһіөӘҚҒҢҰҮҺІӨ]", head))
+    cyr = len(re.findall(r"[а-яА-Я]", head))
+    lat = len(re.findall(r"[a-zA-Z]", head))
+    return cyr > lat and kk <= 15
+
+
+def select_russian(docs: list[dict]) -> list[dict]:
+    """Оставляет по одной РУССКОЙ версии каждой логической страницы.
+    Страницы без русской версии (только kk/en) отбрасываются."""
+    groups: dict[str, list[dict]] = {}
+    for d in docs:
+        groups.setdefault(logical_key(d["source"]), []).append(d)
+
+    def has_lang_prefix(d):
+        return 1 if re.match(r"^/(ru|en|kk)(/|$)", urlparse(d["source"]).path) else 0
+
+    selected, dropped = [], 0
+    for items in groups.values():
+        ru = [d for d in items if d["source"].startswith("manual://")
+              or is_russian(d["text"])]
+        if not ru:
+            dropped += 1
+            continue
+        # предпочитаем версию без префикса (она полнее), затем самую длинную
+        ru.sort(key=lambda d: (has_lang_prefix(d), -len(d["text"])))
+        selected.append(ru[0])
+    print(f"Дедуп/фильтр: {len(docs)} → {len(selected)} русских "
+          f"(отброшено групп без русской версии: {dropped})")
+    return selected
+
+
+def write_corpus(path: str, docs: list[dict]):
+    """Все документы в ОДИН .md: '# Title' + 'Source: url' + текст."""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("<!-- Корпус данных бота фонда Есенова (только русский). "
+                "Добавляй документы блоком: '# Заголовок' / 'Source: <url>' / текст. -->\n\n")
+        for d in docs:
+            title = (d.get("title") or "").replace("\n", " ").strip() or "Без названия"
+            f.write(f"# {title}\n")
+            f.write(f"Source: {d.get('source', '')}\n\n")
+            f.write(d.get("text", "").strip() + "\n\n")
+
+
 def main():
     print("Скрейпинг сайта фонда…")
     docs = crawl()
@@ -138,14 +196,14 @@ def main():
     docs.extend(PROCEDURE_CARDS)
     print(f"Добавлено процедурных карточек: {len(PROCEDURE_CARDS)}")
 
+    docs = select_russian(docs)
+
     import os
     os.makedirs(config.DATA_DIR, exist_ok=True)
-    with open(config.CORPUS_PATH, "w", encoding="utf-8") as f:
-        for i, d in enumerate(docs):
-            d["id"] = i
-            f.write(json.dumps(d, ensure_ascii=False) + "\n")
+    write_corpus(config.CORPUS_PATH, docs)
 
-    print(f"\nГотово → {config.CORPUS_PATH} ({len(docs)} документов)")
+    print(f"\nГотово → {config.CORPUS_PATH}  ({len(docs)} документов)")
+    print("Можешь вручную дописывать свои данные в этот файл (см. README).")
     print("Следующий шаг: python build_index.py")
 
 

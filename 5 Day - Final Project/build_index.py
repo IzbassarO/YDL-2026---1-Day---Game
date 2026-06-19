@@ -1,17 +1,21 @@
 """
-build_index.py — превращает corpus.jsonl в FAISS-индекс.
+build_index.py — превращает Markdown-корпус (data/corpus.md) в FAISS-индекс.
 
 Шаги:
-  1. Читаем документы.
+  1. Читаем data/corpus.md и режем на документы по заголовкам «# Title».
   2. Режем на чанки (CHUNK_SIZE / CHUNK_OVERLAP).
-  3. Получаем эмбеддинги через text-1024 (батчами).
+  3. Получаем эмбеддинги через text-1024.
   4. Нормализуем векторы и кладём в FAISS (IndexFlatIP = косинусная близость).
-  5. Сохраняем index.faiss + meta.json (тексты чанков и их источники).
+  5. Сохраняем index.faiss + index_meta.json (тексты чанков и их источники).
+
+Свои данные просто дописывай в data/corpus.md (формат: «# Заголовок» /
+«Source: <url>» / текст) и перезапускай этот скрипт.
 
 Запуск:  python build_index.py
 """
 import json
 import os
+import re
 import time
 
 import numpy as np
@@ -19,6 +23,35 @@ import requests
 import faiss
 
 import config
+import apilog
+
+
+def load_corpus() -> list[dict]:
+    """Парсит data/corpus.md: документы разделены заголовком «# Title».
+    Внутри документа необязательная строка «Source: <url>», дальше — текст."""
+    raw = open(config.CORPUS_PATH, encoding="utf-8").read()
+    # каждый документ начинается с «# » в начале строки
+    blocks = re.split(r"(?m)^# ", raw)
+    docs = []
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+        lines = block.splitlines()
+        title = lines[0].strip()
+        source, body_lines = "", []
+        for ln in lines[1:]:
+            if not body_lines and ln.strip().lower().startswith("source:"):
+                source = ln.split(":", 1)[1].strip()
+            else:
+                body_lines.append(ln)
+        body = "\n".join(body_lines).strip()
+        if not body:
+            continue
+        if not source:
+            source = "local://corpus.md"
+        docs.append({"source": source, "title": title, "text": body})
+    return docs
 
 
 def chunk_text(text: str, size: int, overlap: int) -> list[str]:
@@ -38,7 +71,8 @@ def chunk_text(text: str, size: int, overlap: int) -> list[str]:
 def embed_batch(texts: list[str]) -> np.ndarray:
     """Эмбеддинги для списка текстов. Поддерживает батч или поэлементно."""
     vectors = []
-    for t in texts:
+    total = len(texts)
+    for n, t in enumerate(texts, 1):
         payload = {"model": config.EMB_MODEL, "input": t}
         headers = {
             "Content-Type": "application/json",
@@ -46,16 +80,21 @@ def embed_batch(texts: list[str]) -> np.ndarray:
         }
         for attempt in range(3):
             try:
-                r = requests.post(
-                    config.EMB_URL, json=payload, headers=headers,
-                    timeout=config.REQUEST_TIMEOUT,
-                )
+                apilog.request(f"EMBED {n}/{total}", config.EMB_MODEL, t)
+                with apilog.timer() as tm:
+                    r = requests.post(
+                        config.EMB_URL, json=payload, headers=headers,
+                        timeout=config.REQUEST_TIMEOUT,
+                    )
+                ok = r.ok
+                vec = r.json()["data"][0]["embedding"] if ok else None
+                apilog.response(f"EMBED {n}/{total}", r.status_code, tm.dt,
+                                f"dim={len(vec)}" if vec else (r.text or "")[:120])
                 r.raise_for_status()
-                data = r.json()
-                vec = data["data"][0]["embedding"]
                 vectors.append(vec)
                 break
             except Exception as e:
+                apilog.error(f"EMBED {n}/{total} попытка {attempt+1}", e)
                 if attempt == 2:
                     raise RuntimeError(f"Эмбеддинг не получен: {e}")
                 time.sleep(1.5 * (attempt + 1))
@@ -65,12 +104,15 @@ def embed_batch(texts: list[str]) -> np.ndarray:
 
 def main():
     if not os.path.exists(config.CORPUS_PATH):
-        raise SystemExit("Нет corpus.jsonl — сначала запусти: python scrape.py")
+        raise SystemExit(
+            f"Нет {config.CORPUS_PATH} — сначала запусти: python scrape.py"
+        )
 
-    docs = []
-    with open(config.CORPUS_PATH, encoding="utf-8") as f:
-        for line in f:
-            docs.append(json.loads(line))
+    docs = load_corpus()
+    if not docs:
+        raise SystemExit(
+            f"В {config.CORPUS_PATH} нет документов — запусти scrape.py или добавь свои."
+        )
 
     # 1. Чанкинг
     meta = []  # параллельно векторам: {text, source, title}

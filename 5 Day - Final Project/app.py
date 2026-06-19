@@ -13,6 +13,7 @@ import streamlit as st
 import config
 from rag import RAG
 import email_report
+import db
 
 
 st.set_page_config(page_title="Грант-бот фонда Есенова", page_icon="🎓")
@@ -29,6 +30,31 @@ def init_state():
     ss.setdefault("user_msg_count", 0)   # сообщений пользователя за сессию
     ss.setdefault("last_request_ts", 0.0)
     ss.setdefault("email_status", None)
+    ss.setdefault("summary", "")         # скользящее саммари диалога (память)
+    ss.setdefault("session_id", None)    # id сессии в Postgres
+    ss.setdefault("db_ok", False)
+    ss.setdefault("db_error", "")
+    # один раз за сессию: поднять схему и создать запись сессии
+    if not ss.get("db_init_tried"):
+        ss.db_init_tried = True
+        try:
+            db.init_db()
+            ss.session_id = db.create_session()
+            ss.db_ok = True
+        except Exception as e:
+            ss.db_ok = False
+            ss.db_error = f"{type(e).__name__}: {e}"
+
+
+def persist(role: str, content: str, grounded=None, top_score=None):
+    """Сохранить сообщение в Postgres (если БД доступна)."""
+    ss = st.session_state
+    if ss.db_ok and ss.session_id:
+        try:
+            db.add_message(ss.session_id, role, content, grounded, top_score)
+        except Exception as e:
+            ss.db_ok = False
+            ss.db_error = f"{type(e).__name__}: {e}"
 
 
 def render_sources(meta: dict):
@@ -49,15 +75,23 @@ def render_sources(meta: dict):
             st.caption(snippet)
 
 
+def render_status(meta: dict):
+    """Бейдж режима ответа: материалы / по истории диалога / отказ."""
+    mode = meta.get("source_mode")
+    if mode == "materials" or (mode is None and meta.get("grounded")):
+        st.caption("✅ Ответ на основе материалов фонда")
+    elif mode == "chat":
+        st.caption("💬 Ответ по истории нашего диалога (не из материалов фонда)")
+    else:
+        st.caption("⚠️ Не найдено в материалах фонда — бот не выдумывает")
+
+
 def render_message(m: dict):
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
         meta = m.get("meta")
         if meta:
-            if meta.get("grounded"):
-                st.caption("✅ Ответ на основе материалов фонда")
-            else:
-                st.caption("⚠️ Не найдено в материалах фонда — бот не выдумывает")
+            render_status(meta)
             render_sources(meta)
 
 
@@ -71,17 +105,57 @@ st.caption(
     "Чего не знаю — честно скажу «не знаю»."
 )
 
+# Готовые примеры вопросов — показываем до начала диалога
+EXAMPLES_ON = [
+    "Что такое Yessenov Data Lab?",
+    "Кто такой Шахмардан Есенов?",
+    "Как подать заявку на грант?",
+    "Кто входит в попечительский совет фонда?",
+]
+EXAMPLES_OFF = [
+    "Какая завтра погода в Алматы?",
+    "Напиши код сортировки на Python",
+    "Кто выиграл чемпионат мира по футболу?",
+]
+
+if not st.session_state.messages:
+    st.info(
+        "**О чём можно спросить:** Yessenov Data Lab (YDL), фонд Есенова и его миссия, "
+        "Шахмардан Есенов, руководство, стипендии и гранты, истории успеха, как подать заявку."
+    )
+    st.markdown("**✅ Примеры по теме фонда** — нажми, чтобы спросить:")
+    cols = st.columns(2)
+    for i, q in enumerate(EXAMPLES_ON):
+        if cols[i % 2].button(q, key=f"ex_on_{i}", use_container_width=True):
+            st.session_state.pending_example = q
+    st.markdown("**🚫 А это бот честно отклонит** (вне темы фонда):")
+    cols2 = st.columns(3)
+    for i, q in enumerate(EXAMPLES_OFF):
+        if cols2[i % 3].button(q, key=f"ex_off_{i}", use_container_width=True):
+            st.session_state.pending_example = q
+
 # --- Сайдбар: лимиты + email ---
 with st.sidebar:
     st.header("О боте")
     st.markdown(
         "- Модель: **gemma4**\n"
         "- Поиск: **RAG / FAISS** по сайту фонда\n"
+        "- Память: **скользящее саммари**\n"
         "- Если данных нет — отвечаю «не знаю»"
     )
     used = st.session_state.user_msg_count
     st.progress(min(used / config.MAX_MESSAGES_PER_SESSION, 1.0),
                 text=f"Сообщений: {used}/{config.MAX_MESSAGES_PER_SESSION}")
+
+    if st.session_state.db_ok:
+        st.caption(f"🟢 Postgres · сессия #{st.session_state.session_id}")
+    else:
+        st.caption("🟡 Postgres недоступен — история только в этой сессии")
+        if st.session_state.db_error:
+            st.caption(f"`{st.session_state.db_error}`")
+    if st.session_state.summary:
+        with st.expander("🧠 Память диалога (саммари)"):
+            st.write(st.session_state.summary)
 
     st.divider()
     st.subheader("📧 Отчёт администратору")
@@ -116,6 +190,9 @@ prompt = st.chat_input(
     "Спросите про гранты, стипендии, программы фонда…",
     disabled=limit_reached,
 )
+# вопрос, выбранный кнопкой-примером
+if not prompt and not limit_reached:
+    prompt = st.session_state.pop("pending_example", None)
 if limit_reached:
     st.warning(
         f"Достигнут лимит сообщений за сессию "
@@ -133,16 +210,20 @@ if prompt:
         st.session_state.user_msg_count += 1
         st.session_state.messages.append({"role": "user", "content": prompt})
         render_message({"role": "user", "content": prompt})
+        persist("user", prompt)
 
         with st.chat_message("assistant"):
             with st.spinner("Ищу в материалах фонда…"):
                 try:
                     rag = get_rag()
-                    history = [
+                    # память: скользящее саммари + последние реплики (бот видит
+                    # свои прошлые ответы); current msg исключаем — он уже в prompt
+                    recent = [
                         {"role": m["role"], "content": m["content"]}
                         for m in st.session_state.messages[:-1]
                     ]
-                    result = rag.answer(prompt, history=history)
+                    result = rag.answer(prompt, summary=st.session_state.summary,
+                                        recent_turns=recent)
                 except Exception as e:
                     err = (
                         "⚠️ Не удалось получить ответ (проблема сети или сервиса "
@@ -152,13 +233,11 @@ if prompt:
                     st.session_state.messages.append(
                         {"role": "assistant", "content": err}
                     )
+                    persist("assistant", err)
                     st.stop()
 
             st.markdown(result["answer"])
-            if result["grounded"]:
-                st.caption("✅ Ответ на основе материалов фонда")
-            else:
-                st.caption("⚠️ Не найдено в материалах фонда — бот не выдумывает")
+            render_status(result)
             render_sources(result)
 
         st.session_state.messages.append({
@@ -168,5 +247,21 @@ if prompt:
                 "grounded": result["grounded"],
                 "top_score": result["top_score"],
                 "hits": result["hits"],
+                "source_mode": result.get("source_mode"),
             },
         })
+        persist("assistant", result["answer"],
+                result["grounded"], result["top_score"])
+
+        # обновляем скользящее саммари (память) — только на содержательных ответах,
+        # чтобы не тратить вызов LLM на «не знаю»
+        if result["grounded"]:
+            try:
+                new_sum = rag.roll_summary(
+                    st.session_state.summary, prompt, result["answer"]
+                )
+                st.session_state.summary = new_sum
+                if st.session_state.db_ok and st.session_state.session_id:
+                    db.set_summary(st.session_state.session_id, new_sum)
+            except Exception:
+                pass  # память не критична для ответа

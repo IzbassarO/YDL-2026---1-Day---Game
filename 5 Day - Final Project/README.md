@@ -12,31 +12,70 @@
 ## Архитектура
 
 ```
-scrape.py        сайт фонда → обход домена → data/corpus.jsonl (+ процедурные карточки)
-build_index.py   corpus → чанкинг (700/120) → эмбеддинги text-1024 → FAISS (косинус)
-rag.py           вопрос → эмбеддинг → FAISS top-4 → порог → gemma4 → ответ
+scrape.py        сайт фонда → обход домена → только русский → data/corpus.md
+build_index.py   corpus.md → чанкинг (700/120) → эмбеддинги text-1024 → FAISS (косинус)
+rag.py           вопрос (+саммари) → эмбеддинг → FAISS top-4 → порог → gemma4 → ответ
+db.py            PostgreSQL: сессии, сообщения, скользящее саммари (история чата)
 app.py           Streamlit UI: чат, бейдж grounded/«не знаю», источники, лимиты, email
 email_report.py  MailerSend: саммари диалога → izok2004@gmail.com (только по кнопке)
-eval_rag.py      системная проверка: in-scope / out-of-scope / калибровка / email
-config.py        ключи, пути, пороги, лимиты
+eval_rag.py      тематическая проверка: in-scope / out-of-scope / калибровка / email
+config.py        пути, пороги, лимиты, Postgres (ключи — в .env)
 ```
+
+## Память диалога и история чата (PostgreSQL)
+
+История чата хранится в **PostgreSQL** (таблицы `sessions`, `messages`).
+Память реализована как **скользящее саммари**: после каждого содержательного
+ответа бот одним дешёвым вызовом обновляет краткое саммари разговора. Оно:
+
+1. **чинит follow-up вопросы** — подмешивается в поисковый запрос, поэтому
+   «а когда он проходит?» находит нужное (на замере top_score 0.45 → 0.77);
+2. даёт боту **«overall»-понимание** диалога без подачи всей истории в LLM —
+   это экономит токены (контекст не растёт с длиной чата).
+
+Если Postgres недоступен — приложение не падает: работает в памяти текущей
+сессии (саммари в `st.session_state`), в сайдбаре виден статус 🟡.
+
+Поднять локальный Postgres (Homebrew):
+
+```bash
+brew install postgresql@16
+brew services start postgresql@16
+createdb -p 5433 yessenov_bot      # порт 5433 — чтобы не конфликтовать с другим PG
+```
+Параметры подключения — в `.env` (`PGHOST/PGPORT/PGDATABASE`), либо `DATABASE_URL`.
+
+## Данные (корпус)
+
+Корпус — один файл **`data/corpus.md`**. Каждый документ:
+
+```
+# Заголовок страницы
+Source: https://yessenovfoundation.org/...
+
+Текст документа…
+```
+
+Добавить свои данные — просто **допиши такой блок** в `data/corpus.md` и
+перезапусти `python build_index.py`. Строка `Source:` необязательна (без неё
+источник будет `local://corpus.md`). `scrape.py` оставляет только русские
+версии страниц (ru/en/kk-дубли схлопываются).
 
 ## Запуск
 
 ```bash
 pip install -r requirements.txt
 
-python scrape.py         # сайт → data/corpus.jsonl
-python build_index.py    # → data/index.faiss + data/meta.json
-python eval_rag.py       # проверка RAG (без отправки email)
+python scrape.py         # сайт → data/corpus.md (только русский)
+python build_index.py    # → data/index.faiss + data/index_meta.json
+python eval_rag.py       # тематическая проверка RAG (без отправки email)
 python eval_rag.py --email   # + реально отправит тестовое письмо себе
 
 streamlit run app.py     # веб-интерфейс
 ```
 
 > Векторная база (`data/`) собрана на сайте фонда. Её состав и статистика —
-> в [`VECTOR_DB.md`](VECTOR_DB.md). Лог системной проверки бота — в
-> [`TEST_REPORT.md`](TEST_REPORT.md).
+> в [`VECTOR_DB.md`](VECTOR_DB.md).
 
 ## Калибровка `RELEVANCE_THRESHOLD`
 

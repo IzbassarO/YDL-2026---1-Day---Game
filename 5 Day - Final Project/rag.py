@@ -8,28 +8,92 @@ rag.py — ядро retrieval-augmented generation.
     отвечать только по контексту.
 """
 import json
+import time
+
 import numpy as np
 import requests
 import faiss
 
 import config
+import apilog
+
+
+def _short_err(r) -> str:
+    """Короткое описание HTTP-ошибки из тела ответа."""
+    body = (r.text or "").replace("\n", " ")
+    return f"ERR {body[:120]}"
+
+
+# Дейктические слова → вопрос, скорее всего, follow-up (зависит от предыдущего хода)
+_DEICTIC = (
+    "он ", "она ", "оно ", "они ", "это", "этот", "эта", "эти", "тот", "та ",
+    "туда", "там", "тогда", "его", "её", "их ", "ему", "ей ", "им ",
+    "ранее", "раньше", "до этого", "выше", "об этом", "о нём", "о ней",
+)
+# Признаки вопроса О САМОМ РАЗГОВОРЕ (мета) — отвечаем по истории, без grounding
+_META = (
+    "что я спрашивал", "что я задавал", "какие вопросы я", "о чём мы",
+    "что ты говорил", "что ты отвечал", "ты сказал", "ты говорил", "ты упоминал",
+    "повтори", "предыдущ", "ранее я", "до этого ты", "наш разговор", "наша беседа",
+    "что я писал",
+)
+
+
+def _is_followup(query: str) -> bool:
+    q = " " + query.lower().strip()
+    if len(query.split()) <= 4:        # очень короткий вопрос — вероятно, продолжение
+        return True
+    return any(w in q for w in _DEICTIC)
+
+
+def _is_meta(query: str) -> bool:
+    q = query.lower()
+    return any(w in q for w in _META)
+
+
+def _post_retry(url: str, payload: dict, headers: dict, kind: str, log_text: str,
+                max_attempts: int = 4):
+    """POST с логом и ретраями на 429/5xx и сетевые сбои (экспон. бэкофф)."""
+    for attempt in range(max_attempts):
+        apilog.request(kind, payload.get("model", ""), log_text)
+        try:
+            with apilog.timer() as t:
+                r = requests.post(url, json=payload, headers=headers,
+                                  timeout=config.REQUEST_TIMEOUT)
+        except Exception as e:
+            apilog.error(kind, e)
+            if attempt == max_attempts - 1:
+                raise
+            time.sleep(1.5 * (attempt + 1))
+            continue
+        # 429 / 5xx — временные, повторяем
+        if r.status_code == 429 or r.status_code >= 500:
+            apilog.response(kind, r.status_code, t.dt,
+                            f"повтор {attempt + 1}/{max_attempts}…")
+            if attempt == max_attempts - 1:
+                return r, t.dt
+            time.sleep(2.0 * (attempt + 1))
+            continue
+        return r, t.dt
 
 
 SYSTEM_PROMPT = (
     "Ты — официальный консультант фонда Шахмардана Есенова. "
-    "Отвечай ТОЛЬКО на основе предоставленного КОНТЕКСТА. "
-    "Правила:\n"
-    "1. Если в контексте нет ответа — честно скажи: «В материалах фонда я не нашёл "
-    "точного ответа на этот вопрос. Уточните, пожалуйста, на сайте "
+    "ФАКТЫ О ФОНДЕ (программы, YDL, гранты, даты, суммы, требования, имена, ссылки) "
+    "бери ТОЛЬКО из блока «МАТЕРИАЛЫ ФОНДА». Правила:\n"
+    "1. Если в МАТЕРИАЛАХ нет ответа на фактический вопрос — честно скажи: «В материалах "
+    "фонда я не нашёл точного ответа на этот вопрос. Уточните, пожалуйста, на сайте "
     "yessenovfoundation.org». НЕ придумывай дедлайны, суммы, требования.\n"
-    "2. Никогда не выдумывай цифры, даты и условия, которых нет в контексте.\n"
-    "3. НЕ используй свои общие знания, память или интернет — источник истины "
-    "только КОНТЕКСТ ниже. Если факта нет в контексте — его для тебя не существует.\n"
-    "4. Если вопрос не относится к фонду Есенова, его грантам, программам или "
-    "деятельности (например, общие вопросы, код, погода, новости) — вежливо "
-    "откажись: это вне твоей компетенции, ты консультант фонда.\n"
-    "5. Если в контексте есть ссылка, относящаяся к вопросу — приведи её.\n"
-    "6. Отвечай кратко, по делу, на языке вопроса."
+    "2. Не используй общие знания о мире и интернет для фактов о фонде — только МАТЕРИАЛЫ.\n"
+    "3. РАЗГОВОР: на вопросы о самой беседе («что я спрашивал?», «что ты отвечал?», "
+    "«повтори», «о чём мы говорили») — отвечай по ИСТОРИИ ДИАЛОГА выше. Это разрешено "
+    "и НЕ требует МАТЕРИАЛОВ.\n"
+    "4. Если пользователь утверждает, что ты раньше что-то говорил — сверься с историей "
+    "диалога. Если такого не было — мягко поправь, не поддакивай выдуманному.\n"
+    "5. Вопрос не про фонд и не про беседу (погода, код, общие знания) — вежливо "
+    "откажись: ты консультант фонда.\n"
+    "6. Если в МАТЕРИАЛАХ есть относящаяся к вопросу ссылка — приведи её. "
+    "Отвечай кратко, по делу, на языке вопроса."
 )
 
 
@@ -46,10 +110,12 @@ class RAG:
             "Content-Type": "application/json",
             "Authorization": f"Bearer {config.EMB_KEY}",
         }
-        r = requests.post(config.EMB_URL, json=payload, headers=headers,
-                          timeout=config.REQUEST_TIMEOUT)
+        r, dt = _post_retry(config.EMB_URL, payload, headers, "EMBED", text)
+        emb = r.json()["data"][0]["embedding"] if r.ok else None
+        apilog.response("EMBED", r.status_code, dt,
+                        f"dim={len(emb)}" if emb else _short_err(r))
         r.raise_for_status()
-        vec = np.array([r.json()["data"][0]["embedding"]], dtype="float32")
+        vec = np.array([emb], dtype="float32")
         faiss.normalize_L2(vec)
         return vec
 
@@ -72,21 +138,70 @@ class RAG:
             "Content-Type": "application/json",
             "Authorization": f"Bearer {config.CHAT_KEY}",
         }
-        r = requests.post(config.CHAT_URL, json=payload, headers=headers,
-                          timeout=config.REQUEST_TIMEOUT)
+        last = messages[-1]["content"] if messages else ""
+        r, dt = _post_retry(config.CHAT_URL, payload, headers, "CHAT", last)
+        content = (r.json()["choices"][0]["message"]["content"].strip()
+                   if r.ok else None)
+        apilog.response("CHAT", r.status_code, dt,
+                        f"«{content[:90]}»" if content else _short_err(r))
         r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip()
+        return content
 
-    def answer(self, query: str, history: list[dict] = None):
+    def _condense(self, query: str, recent_turns: list[dict]) -> str:
+        """Переписывает follow-up в самостоятельный поисковый запрос по истории.
+        Один дешёвый вызов LLM. Самодостаточный вопрос вернётся почти как есть."""
+        convo = "\n".join(
+            f"{'Пользователь' if m['role'] == 'user' else 'Бот'}: {m['content'][:160]}"
+            for m in recent_turns[-4:]
+        )
+        sys_p = (
+            "Перепиши ПОСЛЕДНИЙ вопрос пользователя в самостоятельный поисковый запрос "
+            "на русском: раскрой местоимения (он/это/туда) и подставь опущенный предмет "
+            "из диалога. Верни ТОЛЬКО запрос, без пояснений и кавычек. Если вопрос уже "
+            "самостоятельный — верни его без изменений."
+        )
+        usr_p = f"Диалог:\n{convo}\n\nПоследний вопрос: {query}\n\nСамостоятельный запрос:"
+        try:
+            out = self._call_gemma([
+                {"role": "system", "content": sys_p},
+                {"role": "user", "content": usr_p},
+            ])
+            return (out.strip().strip('"') or query)[:300]
+        except Exception as e:
+            apilog.error("CONDENSE", e)
+            return query
+
+    def answer(self, query: str, summary: str = "", recent_turns: list[dict] = None):
         """
-        Возвращает dict:
-          {answer, hits, grounded(bool), top_score}
-        grounded=False означает "не нашли в данных" — без вызова LLM.
+        Возвращает dict: {answer, hits, grounded(bool), top_score, source_mode}.
+        source_mode: "materials" (по чанкам) | "chat" (по истории) | "none" (отказ).
+
+        Память:
+          - recent_turns: последние реплики диалога (бот ВИДИТ свои прошлые ответы);
+          - summary: «overall»-саммари для долгой памяти (экономит токены);
+          - follow-up вопросы переписываются в самостоятельные перед поиском.
         """
-        hits = self.retrieve(query)
+        recent_turns = recent_turns or []
+        meta = _is_meta(query)
+        apilog.step(f"вопрос: «{query[:80]}»"
+                    + (" [meta]" if meta else "") + (f" [+{len(recent_turns)} реплик]" if recent_turns else ""))
+
+        # 1) Поиск. Для follow-up переписываем запрос в самостоятельный.
+        search_q = query
+        if recent_turns and _is_followup(query):
+            search_q = self._condense(query, recent_turns)
+            if search_q != query:
+                apilog.step(f"condense → «{search_q[:80]}»")
+        hits = self.retrieve(search_q)
         top_score = hits[0]["score"] if hits else 0.0
+        grounded = bool(hits) and top_score >= config.RELEVANCE_THRESHOLD
+        apilog.step(
+            f"retrieve: top_score={top_score:.3f} порог={config.RELEVANCE_THRESHOLD} "
+            f"→ {'GROUNDED' if grounded else ('META→история' if meta else 'НЕ ЗНАЮ (без LLM)')}"
+        )
 
-        if not hits or top_score < config.RELEVANCE_THRESHOLD:
+        # Отказ только если не нашли в материалах И это не вопрос о самой беседе.
+        if not grounded and not meta:
             return {
                 "answer": (
                     "В материалах фонда я не нашёл точного ответа на этот вопрос. "
@@ -95,26 +210,64 @@ class RAG:
                 "hits": hits,
                 "grounded": False,
                 "top_score": top_score,
+                "source_mode": "none",
             }
 
-        context = "\n\n---\n\n".join(
-            f"[Источник: {h['source']}]\n{h['text']}" for h in hits
-        )
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        if history:
-            messages.extend(history[-4:])  # короткая память диалога
-        messages.append({
-            "role": "user",
-            "content": f"КОНТЕКСТ:\n{context}\n\nВОПРОС: {query}",
-        })
+        # 2) Генерация: системный промпт (+саммари) + последние реплики + (материалы) + вопрос.
+        sys_content = SYSTEM_PROMPT
+        if summary:
+            sys_content += (
+                "\n\nКРАТКОЕ САММАРИ ПРЕДЫДУЩЕГО ДИАЛОГА (контекст, не источник "
+                f"фактов о фонде):\n{summary}"
+            )
+        messages = [{"role": "system", "content": sys_content}]
+        for m in recent_turns[-config.SHORT_MEMORY_TURNS:]:
+            messages.append({"role": m["role"], "content": m["content"]})
+
+        if grounded:
+            context = "\n\n---\n\n".join(
+                f"[Источник: {h['source']}]\n{h['text']}" for h in hits
+            )
+            user_block = f"МАТЕРИАЛЫ ФОНДА:\n{context}\n\nВОПРОС: {query}"
+        else:
+            # meta-вопрос о беседе — материалов нет, отвечаем по истории
+            user_block = f"ВОПРОС О НАШЕЙ БЕСЕДЕ: {query}"
+        messages.append({"role": "user", "content": user_block})
 
         answer = self._call_gemma(messages)
         return {
             "answer": answer,
-            "hits": hits,
-            "grounded": True,
+            "hits": hits if grounded else [],
+            "grounded": grounded,
             "top_score": top_score,
+            "source_mode": "materials" if grounded else "chat",
         }
+
+    def roll_summary(self, prev_summary: str, user_msg: str, bot_msg: str) -> str:
+        """Обновляет скользящее саммари одним дешёвым вызовом LLM.
+        Держит его коротким (SUMMARY_MAX_CHARS) — память «в целом», без деталей."""
+        apilog.step("обновляю саммари диалога")
+        sys_p = (
+            "Ты ведёшь КРАТКОЕ саммари диалога пользователя с ботом фонда Есенова. "
+            f"Верни обновлённое саммари НЕ длиннее {config.SUMMARY_MAX_CHARS} символов, "
+            "2-4 предложения. Сохрани ключевые темы, сущности (например YDL, конкретные "
+            "программы/имена) и намерения пользователя. Только сам текст саммари, без преамбул."
+        )
+        usr_p = (
+            f"Текущее саммари:\n{prev_summary or '(пусто)'}\n\n"
+            f"Новый вопрос пользователя: {user_msg}\n"
+            f"Ответ бота: {bot_msg}\n\n"
+            "Обновлённое саммари:"
+        )
+        try:
+            new_sum = self._call_gemma([
+                {"role": "system", "content": sys_p},
+                {"role": "user", "content": usr_p},
+            ])
+        except Exception as e:
+            apilog.error("SUMMARY", e)
+            return prev_summary  # при сбое не теряем старое
+        return new_sum[:config.SUMMARY_MAX_CHARS].strip()
 
     def summarize_dialog(self, history: list[dict]) -> str:
         """Краткое саммари диалога для email администратору."""

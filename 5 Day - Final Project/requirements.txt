@@ -4,3 +4,4 @@ beautifulsoup4
 faiss-cpu
 numpy
 mailersend
+psycopg2-binary
