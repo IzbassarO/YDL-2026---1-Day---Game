@@ -76,14 +76,14 @@ def render_sources(meta: dict):
 
 
 def render_status(meta: dict):
-    """Бейдж режима ответа: материалы / по истории диалога / отказ."""
+    """Бейдж режима ответа: материалы / по истории / приветствие / отказ."""
     mode = meta.get("source_mode")
     if mode == "materials" or (mode is None and meta.get("grounded")):
         st.caption("✅ Ответ на основе материалов фонда")
     elif mode == "chat":
         st.caption("💬 Ответ по истории нашего диалога (не из материалов фонда)")
-    else:
-        st.caption("⚠️ Не найдено в материалах фонда — бот не выдумывает")
+    else:  # general — приветствие / консультация / отказ, без обращения к материалам
+        st.caption("💬 Общий ответ (без обращения к материалам фонда)")
 
 
 def render_message(m: dict):
