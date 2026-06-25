@@ -1,0 +1,10 @@
+Multi-seed confirm (V5 + IterativeImputer):
+  seed=0: 0.8456
+  seed=1: 0.8432
+  seed=42: 0.8432
+  MEAN = 0.8440 ± 0.0011  (median-imputer was 0.8365)
+per-class F1: Wake=0.870 Light=0.859 Deep=0.799 REM=0.844
+  has-eog=0.8569  no-eog=0.8294  (median was 0.857/0.818)
+Wrote submission_05.csv dist: Wake=22.5%, Light=25.7%, Deep=25.8%, REM=26.0%
+Format OK: True True True True
+agree vs submission_04: 96.3%

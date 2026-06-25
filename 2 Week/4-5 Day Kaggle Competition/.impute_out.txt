@@ -1,0 +1,4 @@
+Предсказуемость eog_burst_index из др. признаков: R2=0.809 (низкий R2 => импутация не восстановит сигнал)
+  imputer=median     V5 f1_macro=0.8367
+  imputer=KNN        V5 f1_macro=0.8358
+  imputer=Iterative  V5 f1_macro=0.8432

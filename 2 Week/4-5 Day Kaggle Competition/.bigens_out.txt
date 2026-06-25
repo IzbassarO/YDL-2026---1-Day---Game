@@ -1,0 +1,7 @@
+V4 base        macroF1=0.8360±0.0002
+V5 +rf         macroF1=0.8351±0.0002
+V5 +mlp2       macroF1=0.8365±0.0009
+V6 +rf+mlp2    macroF1=0.8364±0.0004
+
+Best: V5 +mlp2 = 0.8365
+per-class F1: Wake=0.864 Light=0.852 Deep=0.793 REM=0.841

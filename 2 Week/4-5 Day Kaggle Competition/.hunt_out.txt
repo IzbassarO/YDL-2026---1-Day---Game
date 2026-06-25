@@ -1,0 +1,13 @@
+1. RULE HUNT
+   DecisionTree depth=1: f1_macro=0.2710
+   DecisionTree depth=2: f1_macro=0.4680
+   DecisionTree depth=3: f1_macro=0.5813
+   DecisionTree depth=5: f1_macro=0.6338
+   Лучшее одно-правило: eeg_alpha_power > 4.252 -> Light чистота=0.654 (n=1800)  (0.25=случайно, >0.9=структура)
+
+2. ROUTING by eog_burst_index presence (две спец-модели vs единая)
+   has eog: 4499 (50%) | no eog: 4501
+   Single V5  OOF macroF1 = 0.8376
+   Routed V5  OOF macroF1 = 0.8325
+     [has-eog] single=0.8569  routed=0.8513
+     [no-eog] single=0.8183  routed=0.8135

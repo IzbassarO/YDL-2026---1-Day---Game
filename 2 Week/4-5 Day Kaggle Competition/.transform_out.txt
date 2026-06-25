@@ -1,0 +1,8 @@
+--- preprocessing screen (cv seed42, f1_macro) ---
+StandardScaler   SVC=0.8317  MLP=0.8276
+Quantile-normal  SVC=0.8212  MLP=0.8219
+PowerTransformer SVC=0.8299  MLP=0.8240
+
+--- MLP RandomizedSearch (Quantile-normal) ---
+best MLP f1_macro=0.8287
+params: {'m__activation': 'relu', 'm__alpha': np.float64(8e-05), 'm__hidden_layer_sizes': (200, 100), 'm__learning_rate_init': np.float64(0.00076)}
