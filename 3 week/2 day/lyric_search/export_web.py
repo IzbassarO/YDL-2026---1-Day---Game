@@ -19,10 +19,11 @@ lines = pd.read_parquet("data/lines.parquet").sample(N_LINES, random_state=7).re
 wv = api.load("glove-wiki-gigaword-100")
 _w = json.load(open("data/word_idf.json"))
 word_idf, default_w = _w["idf"], _w["default"]
+pc = np.load("data/sif_pc.npy")          # SIF common component (from full corpus)
 
 
 def embed(text):
-    """idf-weighted average of GloVe vectors (frequent fillers count less)."""
+    """SIF sentence vector: idf-weighted average minus the common component."""
     num = np.zeros(wv.vector_size, dtype=np.float32)
     den = 0.0
     for w in TOK.findall(text.lower()):
@@ -33,6 +34,7 @@ def embed(text):
     if den == 0:
         return None
     v = num / den
+    v = v - (v @ pc) * pc
     return v / max(np.linalg.norm(v), 1e-9)
 
 
@@ -45,6 +47,70 @@ for i, line in enumerate(lines["line"]):
     keep.append(i)
 lines = lines.iloc[keep].reset_index(drop=True)
 meta = [{"l": r.line, "a": r.artist, "s": r.song} for r in lines.itertuples()]
+
+# Full lyrics per song, for the click-through "song page". Stored once per song;
+# each result line keeps a song index (si) so the UI can open the whole text.
+raw = pd.read_csv("data/spotify_millsongdata.csv").dropna(subset=["text", "artist", "song"])
+raw["k"] = raw["artist"].str.strip() + " :: " + raw["song"].str.strip()
+full = dict(zip(raw["k"], raw["text"]))
+
+
+def clean_lyrics(text, cap=90):
+    out = []
+    for ln in str(text).splitlines():
+        ln = re.sub(r"\s+", " ", ln).strip()
+        if ln:
+            out.append(ln)
+    return out[:cap]
+
+
+songs, song_index = [], {}
+for m in meta:
+    key = f"{m['a'].strip()} :: {m['s'].strip()}"
+    if key not in song_index:
+        song_index[key] = len(songs)
+        songs.append({"a": m["a"], "s": m["s"], "lines": clean_lyrics(full.get(key, ""))})
+    m["si"] = song_index[key]
+print(f"songs with full lyrics: {len(songs):,}")
+
+# Example queries for the chips: concepts, long sentences, typos, made-up words,
+# and a few REAL lyric lines from the corpus (with their song shown, so you know
+# which song the search is expected to surface).
+def _avg_idf(line):
+    ws = TOK.findall(line.lower())
+    return sum(word_idf.get(w, default_w) for w in ws) / len(ws) if ws else 0.0
+
+
+lyric_ex, seen_songs = [], set()
+for m in meta:                                  # meta is already shuffled (random sample)
+    ws = TOK.findall(m["l"].lower())
+    if not (8 <= len(ws) <= 13):
+        continue
+    if sum(1 for w in ws if w in word_idf) / len(ws) < 0.85:   # mostly real English words
+        continue
+    if not (4.5 <= _avg_idf(m["l"]) <= 7.5):    # readable, content-bearing (not too rare/foreign)
+        continue
+    if m["s"] in seen_songs:
+        continue
+    seen_songs.add(m["s"])
+    lyric_ex.append({"q": m["l"], "note": f'from {m["a"]} — {m["s"]}'})
+    if len(lyric_ex) >= 6:
+        break
+
+examples = [
+    {"q": "feeling heartbroken and alone"},
+    {"q": "falling in love for the first time"},
+    {"q": "money power and fame"},
+    {"q": "young wild and free"},
+    {"q": "the feeling when someone you love walks away for good", "note": "long query"},
+    {"q": "watching the city lights from a rooftop late at night", "note": "long query"},
+    {"q": "lying awake remembering everything we used to be", "note": "long query"},
+    {"q": "heartbrokn and lonley", "note": "with a typo"},
+    {"q": "danceing in the moonlite", "note": "with typos"},
+    {"q": "florbex zindar quomplut", "note": "made-up words"},
+    {"q": "wibble znarf blorptron", "note": "made-up words"},
+] + lyric_ex
+print(f"example chips: {len(examples)} ({len(lyric_ex)} real lyric lines)")
 
 tfidf = TfidfVectorizer(stop_words="english", min_df=2)
 tfidf.fit(lines["line"])
@@ -98,10 +164,13 @@ TEMPLATE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
        display:flex;flex-direction:column;line-height:1.25;text-align:center;transition:.15s}
  .seg small{font-size:11px;opacity:.85;font-weight:400}
  .seg.on{background:#fff;color:var(--ink);font-weight:600;box-shadow:0 1px 4px rgba(28,30,60,.14)}
- .chips{margin-top:16px}
- .chip{display:inline-block;background:#fff;border:1px solid #dadde7;color:var(--muted);padding:6px 13px;
-       border-radius:18px;margin:0 7px 8px 0;font-size:13px;cursor:pointer;transition:.15s}
- .chip:hover{border-color:var(--accent);color:var(--accent);background:var(--accentSoft)}
+ .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px}
+ .chip{display:flex;flex-direction:column;align-items:flex-start;gap:2px;max-width:340px;text-align:left;
+       background:#fff;border:1px solid #dadde7;border-radius:12px;padding:8px 12px;cursor:pointer;font:inherit;transition:.15s}
+ .chip:hover{border-color:var(--accent);background:var(--accentSoft)}
+ .chip .cq{font-size:13.5px;color:var(--ink);line-height:1.35}
+ .chip:hover .cq{color:var(--accent)}
+ .chip .cnote{font-size:11.5px;color:var(--faint)}
 
  /* layout */
  .layout{display:grid;grid-template-columns:1.55fr 1fr;gap:26px;align-items:start;padding:28px 0 8px}
@@ -110,8 +179,62 @@ TEMPLATE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 
  /* results */
  .hit{display:flex;gap:14px;align-items:flex-start;background:var(--card);border:1px solid var(--line);
-      border-radius:13px;padding:14px 16px;margin-bottom:10px;box-shadow:0 1px 2px rgba(28,30,60,.04);animation:rise .3s ease both}
+      border-radius:13px;padding:14px 16px;margin-bottom:10px;box-shadow:0 1px 2px rgba(28,30,60,.04);
+      animation:rise .3s ease both;cursor:pointer;transition:border-color .15s,box-shadow .15s,transform .15s}
+ .hit:hover{border-color:#c6c9e6;box-shadow:0 6px 18px rgba(28,30,60,.09);transform:translateY(-1px)}
+ .hit .open{flex:0 0 auto;align-self:center;color:var(--faint);transition:.15s}
+ .hit:hover .open{color:var(--accent);transform:translateX(2px)}
  @keyframes rise{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:none}}
+
+ /* song page (click-through) */
+ .songview{position:fixed;inset:0;background:rgba(20,22,40,.46);backdrop-filter:blur(3px);z-index:50;
+      display:flex;justify-content:center;align-items:flex-start;padding:42px 18px;overflow:auto}
+ .songview.hidden{display:none}
+ .songcard{background:var(--card);max-width:620px;width:100%;border-radius:16px;
+      box-shadow:0 24px 70px rgba(20,22,40,.34);overflow:hidden;animation:pop .24s ease both}
+ @keyframes pop{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
+ .songhead{position:sticky;top:0;background:var(--card);border-bottom:1px solid var(--line);
+      padding:15px 20px;display:flex;align-items:center;gap:13px;z-index:1}
+ .back{border:0;background:#f1f2f8;border-radius:9px;padding:9px 13px;cursor:pointer;font:inherit;
+      font-weight:600;color:var(--muted);transition:.15s;white-space:nowrap}
+ .back:hover{background:#e6e8f2;color:var(--ink)}
+ .songtitle{font-size:16px;font-weight:700;line-height:1.3}
+ .songartist{font-size:13px;color:var(--muted)}
+ .lyrics{padding:16px 22px 30px}
+ .lyrics .ln{padding:3px 9px;border-radius:6px;color:#3d4250;font-size:15.5px}
+ .lyrics .ln.match{background:#fff0bd;color:#5a4500;font-weight:600;scroll-margin:90px}
+ .lyrics .na{color:var(--faint);font-size:14px}
+
+ /* tabs + game */
+ .tabs{display:flex;gap:4px;margin:20px 0 0;border-bottom:1px solid var(--line)}
+ .tab{border:0;background:transparent;padding:11px 18px;font:inherit;font-size:15px;color:var(--muted);cursor:pointer;
+      border-bottom:2px solid transparent;margin-bottom:-1px;font-weight:500;transition:.15s}
+ .tab:hover{color:var(--ink)}
+ .tab.on{color:var(--accent);border-bottom-color:var(--accent);font-weight:600}
+ #searchControls{margin-top:18px}
+ .game{max-width:620px;margin:6px auto 0}
+ .game-stats{display:flex;gap:12px;margin-bottom:18px}
+ .stat{flex:1;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;text-align:center;box-shadow:0 1px 2px rgba(28,30,60,.04)}
+ .stat-n{font-size:27px;font-weight:700;color:var(--ink);font-variant-numeric:tabular-nums;line-height:1}
+ .stat-n.hot{color:#e8590c}
+ .stat-l{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-top:5px}
+ .game-card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:24px;box-shadow:0 4px 16px rgba(28,30,60,.05)}
+ .game-q{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;font-weight:600;margin-bottom:10px}
+ .game-line{font-size:22px;font-weight:600;line-height:1.4;margin-bottom:20px;color:var(--ink)}
+ .game-options{display:flex;flex-direction:column;gap:10px}
+ .opt{text-align:left;border:1px solid #d8dbe6;background:#fff;border-radius:11px;padding:12px 15px;font:inherit;
+      font-size:15px;cursor:pointer;transition:.12s;color:var(--ink)}
+ .opt:hover:not(:disabled){border-color:var(--accent);background:var(--accentSoft)}
+ .opt b{display:block;font-weight:600}.opt small{color:var(--muted);font-size:13px}
+ .opt:disabled{cursor:default}
+ .opt.correct{border-color:#37b24d;background:#ebfbee}
+ .opt.wrong{border-color:#f03e3e;background:#fff0f0}
+ .game-feedback{min-height:22px;margin-top:14px;font-size:14px;font-weight:500}
+ .game-feedback a{color:var(--accent);cursor:pointer;text-decoration:underline}
+ .game-next{margin-top:14px;border:0;border-radius:11px;padding:13px 22px;font:inherit;font-weight:600;color:#fff;
+      background:linear-gradient(135deg,var(--accent),var(--accent2));cursor:pointer;width:100%;transition:.15s}
+ .game-next:hover:not([disabled]){filter:brightness(1.06)}
+ .game-next[disabled]{opacity:.4;cursor:default}
  .rank{flex:0 0 26px;height:26px;border-radius:8px;background:#f1f2f8;color:#9498a8;font-size:12px;font-weight:700;
       display:grid;place-items:center;margin-top:2px}
  .hbody{flex:1;min-width:0}
@@ -174,21 +297,28 @@ TEMPLATE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
   <h1>Lyric Search</h1>
   <p class="tagline">Find a song line by what it <b>means</b>, what it <b>says</b>, or how it's <b>spelled</b> —
      searched across __N__ lines of real lyrics.</p>
-  <div class="searchbar">
-    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-         stroke-linecap="round"><circle cx="11" cy="11" r="7"></circle><path d="M21 21l-4.3-4.3"></path></svg>
-    <input id="q" placeholder="Try: feeling heartbroken and alone" autofocus>
-    <button onclick="run()">Search</button>
+  <div class="tabs">
+    <button class="tab on" data-v="search" onclick="showView('search')">Search</button>
+    <button class="tab" data-v="play" onclick="showView('play')">Guess the Song</button>
   </div>
-  <div class="segmented" id="modes">
-    <button class="seg on" data-m="glove">Meaning<small>synonyms &amp; mood</small></button>
-    <button class="seg" data-m="tfidf">Keywords<small>exact words</small></button>
-    <button class="seg" data-m="tri">Fuzzy<small>typo-tolerant</small></button>
+  <div id="searchControls">
+    <div class="searchbar">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+           stroke-linecap="round"><circle cx="11" cy="11" r="7"></circle><path d="M21 21l-4.3-4.3"></path></svg>
+      <input id="q" placeholder="Try: feeling heartbroken and alone" autofocus>
+      <button onclick="run()">Search</button>
+    </div>
+    <div class="segmented" id="modes">
+      <button class="seg on" data-m="smart">Smart<small>meaning + words</small></button>
+      <button class="seg" data-m="glove">Meaning<small>synonyms &amp; mood</small></button>
+      <button class="seg" data-m="tfidf">Keywords<small>exact words</small></button>
+      <button class="seg" data-m="tri">Fuzzy<small>typo-tolerant</small></button>
+    </div>
+    <div class="chips" id="chips"></div>
   </div>
-  <div class="chips" id="chips"></div>
 </div></header>
 
-<main class="wrap layout">
+<main class="wrap layout" id="searchView">
   <section>
     <p class="col-head">Results <span id="rescount"></span></p>
     <div id="out"></div>
@@ -198,21 +328,46 @@ TEMPLATE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
   </aside>
 </main>
 
-<section class="wrap learn">
+<section class="wrap" id="gameView" style="display:none">
+  <div class="game">
+    <div class="game-stats">
+      <div class="stat"><div class="stat-n" id="g-score">0</div><div class="stat-l">Score</div></div>
+      <div class="stat"><div class="stat-n" id="g-streak">0</div><div class="stat-l">Streak</div></div>
+      <div class="stat"><div class="stat-n" id="g-best">0</div><div class="stat-l">Best streak</div></div>
+    </div>
+    <div class="game-card">
+      <div class="game-q">Which song is this line from?</div>
+      <div class="game-line" id="g-line"></div>
+      <div class="game-options" id="g-options"></div>
+      <div class="game-feedback" id="g-feedback"></div>
+      <button class="game-next" id="g-next" onclick="newQuestion()" disabled>Next line</button>
+    </div>
+  </div>
+</section>
+
+<div class="songview hidden" id="songview" onclick="if(event.target===this)closeSong()"></div>
+
+<section class="wrap learn" id="learn">
   <h2>How it works</h2>
   <p class="lead">A computer can't compare text by meaning directly. So we turn every line into a
      <b>vector</b> (a list of numbers), turn your query into a vector the same way, and rank lines by
      <b>cosine similarity</b> — the angle between the two. All three modes share that idea; they differ only
      in how the vector is built.</p>
 
-  <h2>The three methods</h2>
+  <h2>The methods</h2>
   <div class="methods">
+    <div class="card"><span class="tag">Smart · default</span>
+      <h3>Hybrid ranking</h3>
+      <p>Blends two signals into one score: <b>0.65 · meaning + 0.35 · keywords</b>. You get the synonym-awareness
+         of embeddings <i>and</i> the precision of exact words.</p>
+      <p>If the query has no embeddable words (a typo), it automatically falls back to <b>Fuzzy</b>.</p>
+      <p class="tradeoff">Best general-purpose mode; the others isolate one signal for comparison.</p></div>
     <div class="card"><span class="tag">Meaning</span>
-      <h3>Averaged GloVe embeddings</h3>
-      <p>GloVe gives every word 100 numbers, learned so words used in similar contexts sit close together —
-         <code>sad</code>, <code>lonely</code> and <code>heartbroken</code> end up near each other.</p>
-      <p>A line's vector is the <b>idf-weighted average</b> of its word vectors — rare content words count more,
-         fillers like <code>the</code>/<code>and</code> barely count. That's why it finds synonyms with no shared words.</p>
+      <h3>SIF sentence embeddings</h3>
+      <p>GloVe gives every word 100 numbers, learned so words in similar contexts sit close —
+         <code>sad</code>, <code>lonely</code>, <code>heartbroken</code> end up near each other.</p>
+      <p>A line's vector is the <b>idf-weighted average</b> of its word vectors, then we subtract the
+         <b>common component</b> shared by all lines (the SIF trick). Both steps sharpen the meaning signal.</p>
       <p class="tradeoff">Trade-off: ignores word order; can't embed misspelled words.</p></div>
     <div class="card"><span class="tag">Keywords</span>
       <h3>tf-idf bag-of-words</h3>
@@ -251,9 +406,9 @@ TEMPLATE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 
 <script>
 const GLOVE=__GLOVE__, META=__META__, VECS=__VECS__, IDF=__IDF__, TOKS=__TOKS__,
-      WEIGHT=__WEIGHT__, WDEFAULT=__WDEFAULT__, DIM=100;
-const MODE_LABEL={glove:"Meaning",tfidf:"Keywords",tri:"Fuzzy"};
-let MODE="glove";
+      WEIGHT=__WEIGHT__, WDEFAULT=__WDEFAULT__, SONGS=__SONGS__, PC=__PC__, EXAMPLES=__EXAMPLES__, DIM=100;
+const MODE_LABEL={smart:"Smart",glove:"Meaning",tfidf:"Keywords",tri:"Fuzzy"};
+let MODE="smart";
 
 const lineNorm=TOKS.map(ts=>{let s=0;const seen=new Set();
   for(const w of ts){if(!seen.has(w)){seen.add(w);const d=IDF[w]||0;s+=d*d}}return Math.sqrt(s)||1});
@@ -265,9 +420,11 @@ const GWORDS=Object.keys(GLOVE), GNORM={};
 for(const w of GWORDS){let s=0;const v=GLOVE[w];for(let i=0;i<DIM;i++)s+=v[i]*v[i];GNORM[w]=Math.sqrt(s)||1;}
 
 function toks(q){return (q.toLowerCase().match(/[a-z']+/g)||[]);}
-function embed(text){const ts=toks(text);const v=new Float32Array(DIM);let den=0; // idf-weighted average
+function embed(text){const ts=toks(text);const v=new Float32Array(DIM);let den=0; // SIF: idf-weighted avg − common component
   for(const t of ts){const g=GLOVE[t];if(g){const wt=WEIGHT[t]||WDEFAULT;for(let i=0;i<DIM;i++)v[i]+=wt*g[i];den+=wt}}
-  if(!den)return null;let s=0;for(let i=0;i<DIM;i++){v[i]/=den;s+=v[i]*v[i]}
+  if(!den)return null;for(let i=0;i<DIM;i++)v[i]/=den;
+  let dot=0;for(let i=0;i<DIM;i++)dot+=v[i]*PC[i];           // remove SIF common component
+  let s=0;for(let i=0;i<DIM;i++){v[i]-=dot*PC[i];s+=v[i]*v[i]}
   s=Math.sqrt(s)||1;for(let i=0;i<DIM;i++)v[i]/=s;return v;}
 function nearestWords(qv,k){const out=[];
   for(const w of GWORDS){const g=GLOVE[w];let d=0;for(let i=0;i<DIM;i++)d+=g[i]*qv[i];out.push([d/GNORM[w],w])}
@@ -294,7 +451,23 @@ function run(){
   const qt=toks(q);
   let scored=null, detail=null, steps=[];
 
-  if(MODE==='glove'){
+  if(MODE==='smart'){
+    const qv=embed(q);
+    if(!qv){const qs=trigrams(q);
+      steps=[{n:1,t:'Looks misspelled — nothing to embed',html:'falling back to Fuzzy'},
+        {n:2,t:'Split each word into 3-letter chunks',html:pills(sp([...qs]).slice(0,14))+(qs.size>14?' …':'')},
+        {n:3,t:'Rank by shared chunks (Dice)',html:'typo-tolerant matching'}];
+      scored=scoreTri(q);detail={type:'tri',qs:qs};}
+    else{const g=scoreGlove(q);const kept=qt.filter(t=>IDF[t]);const tArr=kept.length?scoreTfidf(q):null;
+      scored=g.map(p=>[0.65*p[0]+0.35*(tArr?tArr[p[1]][0]:0),p[1]]);
+      steps=[{n:1,t:'Tokenize the query',html:pills(qt)},
+        {n:2,t:'Meaning vector (SIF GloVe)',html:'reads as '+pills(nearestWords(qv,5),'hit')},
+        {n:3,t:'Keyword signal (tf-idf)',html:kept.length?pills(kept,'hit'):'<span style="color:var(--faint)">no strong keywords</span>'},
+        {n:4,t:'Blend the two scores',html:'<b>0.65</b> · meaning + <b>0.35</b> · keywords'},
+        {n:5,t:'Rank &amp; diversify',html:'keep the top, max 2 lines per song'}];
+      detail={type:'words',words:kept};}
+  }
+  else if(MODE==='glove'){
     const found=qt.filter(t=>GLOVE[t]), miss=qt.filter(t=>!GLOVE[t]);
     const qv=embed(q);
     steps=[{n:1,t:'Tokenize the query',html:pills(qt)},
@@ -343,23 +516,91 @@ function run(){
     else if(detail&&detail.type==='tri'){const ls=lineTri[i];const sh=[...detail.qs].filter(g=>ls.has(g));
       why=`shared chunks: ${sp(sh).slice(0,8).join(' · ')}${sh.length>8?' …':''}`;}
     const pct=Math.round(Math.max(0,Math.min(1,sc))*100);
-    return `<div class="hit" style="animation-delay:${idx*30}ms">
+    return `<div class="hit" style="animation-delay:${idx*30}ms" onclick="openSong(${i})" title="Open full lyrics">
       <div class="rank">${idx+1}</div>
       <div class="hbody"><div class="ly">"${line}"</div><div class="mt">${esc(m.a)} · ${esc(m.s)}</div>
         ${why?`<div class="why">${esc(why)}</div>`:''}</div>
       <div class="score"><div class="scnum">${sc.toFixed(2)}</div><div class="scbar"><i style="width:${pct}%"></i></div></div>
+      <svg class="open" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"></path></svg>
     </div>`}).join('');
 }
+
+function openSong(i){
+  const m=META[i], song=SONGS[m.si];
+  const key=m.l.trim().toLowerCase();
+  const body=(song.lines&&song.lines.length)
+    ? song.lines.map(ln=>`<div class="ln${ln.trim().toLowerCase()===key?' match':''}">${esc(ln)}</div>`).join('')
+    : '<div class="na">Full lyrics are not available for this song.</div>';
+  document.getElementById('songview').innerHTML=
+    `<div class="songcard" onclick="event.stopPropagation()">
+       <div class="songhead"><button class="back" onclick="closeSong()">&larr; Back</button>
+         <div><div class="songtitle">${esc(song.s)}</div><div class="songartist">${esc(song.a)}</div></div></div>
+       <div class="lyrics">${body}</div></div>`;
+  document.getElementById('songview').classList.remove('hidden');
+  document.body.style.overflow='hidden';
+  const mt=document.querySelector('.lyrics .match'); if(mt) mt.scrollIntoView({block:'center'});
+}
+function closeSong(){document.getElementById('songview').classList.add('hidden');document.body.style.overflow='';}
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeSong()});
 
 document.querySelectorAll('.seg').forEach(el=>el.onclick=()=>{
   document.querySelectorAll('.seg').forEach(e=>e.classList.remove('on'));
   el.classList.add('on');MODE=el.dataset.m;run();});
-const examples=["feeling heartbroken and alone","heartbrokn and lonley","i want to dance all night",
-                "missing my hometown","money and power"];
 const chips=document.getElementById('chips');
-examples.forEach(e=>{const c=document.createElement('span');c.className='chip';c.textContent=e;
-  c.onclick=()=>{document.getElementById('q').value=e;run()};chips.appendChild(c)});
+EXAMPLES.forEach(e=>{const c=document.createElement('button');c.className='chip';
+  c.innerHTML=`<span class="cq">${esc(e.q)}</span>`+(e.note?`<span class="cnote">${esc(e.note)}</span>`:'');
+  c.onclick=()=>{document.getElementById('q').value=e.q;run();};
+  chips.appendChild(c)});
 document.getElementById('q').addEventListener('keydown',e=>{if(e.key==='Enter')run()});
+
+/* ---------- Guess the Song game ---------- */
+const G={score:0,streak:0,best:+(localStorage.getItem('lg_best')||0),answered:true};
+document.getElementById('g-best').textContent=G.best;
+function shuffle(a){for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]]}return a;}
+function goodLine(i){const t=toks(META[i].l);return t.length>=5 && t.some(w=>IDF[w]&&IDF[w]>4.5);}
+function newQuestion(){
+  let i=0,tries=0;do{i=Math.floor(Math.random()*META.length);tries++}while(tries<60&&!goodLine(i));
+  const correct=META[i].si, v=VECS[i];
+  const sims=[];for(let j=0;j<VECS.length;j++){const vec=VECS[j];let d=0;for(let k=0;k<DIM;k++)d+=vec[k]*v[k];sims.push([d,j])}
+  sims.sort((a,b)=>b[0]-a[0]);
+  const distract=[],seen=new Set([correct]);
+  for(const pair of sims){const sj=META[pair[1]].si;if(!seen.has(sj)){seen.add(sj);distract.push(sj)}if(distract.length>=3)break}
+  while(distract.length<3){const sj=META[Math.floor(Math.random()*META.length)].si;if(!seen.has(sj)){seen.add(sj);distract.push(sj)}}
+  const opts=shuffle([correct].concat(distract));
+  G.answered=false;
+  document.getElementById('g-line').textContent='"'+META[i].l+'"';
+  document.getElementById('g-feedback').innerHTML='';
+  document.getElementById('g-next').disabled=true;
+  document.getElementById('g-options').innerHTML=opts.map(si=>{const s=SONGS[si];
+    return `<button class="opt" data-si="${si}" onclick="answer(${si},${correct},${i})">
+      <b>${esc(s.s)}</b><small>${esc(s.a)}</small></button>`}).join('');
+}
+function answer(si,correct,lineIdx){
+  if(G.answered)return;G.answered=true;
+  const ok=si===correct;
+  document.querySelectorAll('.opt').forEach(b=>{b.disabled=true;const bsi=+b.dataset.si;
+    if(bsi===correct)b.classList.add('correct');else if(bsi===si)b.classList.add('wrong')});
+  if(ok){G.score++;G.streak++;if(G.streak>G.best){G.best=G.streak;localStorage.setItem('lg_best',G.best)}}
+  else G.streak=0;
+  document.getElementById('g-score').textContent=G.score;
+  const st=document.getElementById('g-streak');st.textContent=G.streak;st.classList.toggle('hot',G.streak>=3);
+  document.getElementById('g-best').textContent=G.best;
+  const s=SONGS[correct];
+  document.getElementById('g-feedback').innerHTML=
+    (ok?'<span style="color:#2b8a3e">Correct!</span> ':'<span style="color:#c92a2a">Not quite.</span> ')
+    +`It's <b>${esc(s.s)}</b> by ${esc(s.a)}. <a onclick="openSong(${lineIdx})">View lyrics</a>`;
+  document.getElementById('g-next').disabled=false;
+}
+function showView(v){const search=v==='search';
+  document.getElementById('searchControls').style.display=search?'':'none';
+  document.getElementById('searchView').style.display=search?'grid':'none';
+  document.getElementById('learn').style.display=search?'':'none';
+  document.getElementById('gameView').style.display=search?'none':'block';
+  document.querySelectorAll('.tab').forEach(e=>e.classList.toggle('on',e.dataset.v===v));
+  if(!search && !document.getElementById('g-options').children.length) newQuestion();
+}
+
 run();
 </script></body></html>"""
 
@@ -370,6 +611,9 @@ html = (TEMPLATE.replace("__GLOVE__", json.dumps(glove))
                 .replace("__TOKS__", json.dumps(toks))
                 .replace("__WEIGHT__", json.dumps(weight))
                 .replace("__WDEFAULT__", json.dumps(default_w))
+                .replace("__SONGS__", json.dumps(songs, ensure_ascii=False))
+                .replace("__PC__", json.dumps([round(float(x), 4) for x in pc]))
+                .replace("__EXAMPLES__", json.dumps(examples, ensure_ascii=False))
                 .replace("__N__", f"{len(meta):,}"))
 with open("artifacts/search.html", "w") as f:
     f.write(html)

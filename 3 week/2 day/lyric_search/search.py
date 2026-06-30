@@ -13,18 +13,19 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 _lines = _tfidf = _tmat = _gmat = _wv = None
 _tri = _trimat = None
-_widf = _wdefault = None
+_widf = _wdefault = _pc = None
 TOK = re.compile(r"[a-z']+")
 
 
 def _load():
-    global _lines, _tfidf, _tmat, _gmat, _wv, _tri, _trimat, _widf, _wdefault
+    global _lines, _tfidf, _tmat, _gmat, _wv, _tri, _trimat, _widf, _wdefault, _pc
     if _lines is not None:
         return
     _lines = pd.read_parquet("data/lines.parquet")
     blob = pickle.load(open("data/tfidf.pkl", "rb"))
     _tfidf, _tmat = blob["vectorizer"], blob["matrix"]
     _gmat = np.load("data/glove_lines.npy")
+    _pc = np.load("data/sif_pc.npy")
     _wv = api.load("glove-wiki-gigaword-100")
     tri = pickle.load(open("data/trigram.pkl", "rb"))
     _tri, _trimat = tri["vectorizer"], tri["matrix"]
@@ -33,7 +34,7 @@ def _load():
 
 
 def _embed(text):
-    """idf-weighted average of GloVe vectors (frequent fillers count less)."""
+    """SIF sentence vector: idf-weighted average, minus the common component."""
     num = np.zeros(_gmat.shape[1], dtype=np.float32)
     den = 0.0
     for w in TOK.findall(text.lower()):
@@ -44,6 +45,7 @@ def _embed(text):
     if den == 0:
         return num
     v = num / den
+    v = v - (v @ _pc) * _pc            # remove SIF common component
     return v / max(np.linalg.norm(v), 1e-9)
 
 
@@ -94,9 +96,23 @@ def search_trigram(query, n=5):
     return _format(_top(scores, n), scores)
 
 
+def search_smart(query, n=5, w_glove=0.65, w_tfidf=0.35):
+    """Hybrid: blend meaning (SIF GloVe) and keywords (tf-idf); fall back to fuzzy on typos."""
+    _load()
+    g = _gmat @ _embed(query)                       # meaning, cosine
+    t = cosine_similarity(_tfidf.transform([query]), _tmat).ravel()  # keywords, cosine
+    if not np.any(g):                               # query had no embeddable words -> typos
+        tri = _tri.transform([query.lower()])
+        return _format(_top(cosine_similarity(tri, _trimat).ravel(), n),
+                       cosine_similarity(tri, _trimat).ravel())
+    scores = w_glove * g + w_tfidf * t
+    return _format(_top(scores, n), scores)
+
+
 def compare(query, n=5):
     print(f'\nQuery: "{query}"')
-    methods = [("tf-idf   (keywords)", search_tfidf),
+    methods = [("smart    (hybrid)  ", search_smart),
+               ("tf-idf   (keywords)", search_tfidf),
                ("GloVe    (meaning) ", search_glove),
                ("trigram  (fuzzy)   ", search_trigram)]
     for name, fn in methods:

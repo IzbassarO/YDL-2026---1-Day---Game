@@ -55,11 +55,20 @@ def embed(text):
 
 
 glove_matrix = np.vstack([embed(t) for t in texts]).astype(np.float32)
+
+# SIF step 2 (Arora et al. 2017): remove the top principal component — the
+# "common-discourse" direction every line shares. Subtracting it sharpens the
+# part that actually distinguishes lines, which improves semantic search.
+from sklearn.decomposition import TruncatedSVD
+pc = TruncatedSVD(n_components=1, random_state=42).fit(glove_matrix).components_[0].astype(np.float32)
+glove_matrix -= (glove_matrix @ pc)[:, None] * pc[None, :]
+np.save("data/sif_pc.npy", pc)
+
 norms = np.linalg.norm(glove_matrix, axis=1, keepdims=True)
 glove_matrix /= np.clip(norms, 1e-9, None)
-print(f"GloVe line matrix: {glove_matrix.shape}")
+print(f"GloVe line matrix: {glove_matrix.shape}  (SIF common component removed)")
 
 with open("data/tfidf.pkl", "wb") as f:
     pickle.dump({"vectorizer": tfidf, "matrix": tfidf_matrix}, f)
 np.save("data/glove_lines.npy", glove_matrix)
-print("saved -> data/tfidf.pkl, data/glove_lines.npy, data/word_idf.json")
+print("saved -> data/tfidf.pkl, data/glove_lines.npy, data/word_idf.json, data/sif_pc.npy")
